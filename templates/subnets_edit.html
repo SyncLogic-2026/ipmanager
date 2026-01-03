@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Subnet bearbeiten{% endblock title %}
+{% block content %}
+<h1>Subnet bearbeiten</h1>
+
+{% if error %}
+<p style="color:red;">{{ error }}</p>
+{% endif %}
+
+<form method="post" action="/subnets/{{ subnet.id }}">
+  <label>
+    Name<br />
+    <input name="name" required value="{{ subnet.name }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    CIDR (z. B. 192.168.174.0/24)<br />
+    <input name="cidr" required value="{{ subnet.cidr }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    DNS Zone (optional)<br />
+    <input name="dns_zone" value="{{ subnet.dns_zone | default(value='') }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    Reverse Zone (optional)<br />
+    <input name="reverse_zone" value="{{ subnet.reverse_zone | default(value='') }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    DHCP Pool Start (optional, IPv4)<br />
+    <input name="dhcp_pool_start" placeholder="z. B. 192.168.174.50" value="{{ subnet.dhcp_pool_start | default(value='') }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    DHCP Pool End (optional, IPv4)<br />
+    <input name="dhcp_pool_end" placeholder="z. B. 192.168.174.200" value="{{ subnet.dhcp_pool_end | default(value='') }}" />
+  </label>
+  <br /><br />
+
+  <label>
+    DHCP enabled
+    <input type="checkbox" name="dhcp_enabled" value="true" {% if subnet.dhcp_enabled %}checked{% endif %} />
+  </label>
+  <br /><br />
+
+  <label>
+    PXE enabled
+    <input type="checkbox" name="pxe_enabled" value="true" {% if subnet.pxe_enabled %}checked{% endif %} />
+  </label>
+  <br /><br />
+
+  <button type="submit">Speichern</button>
+  <a href="/subnets" style="margin-left: 12px;">Abbrechen</a>
+</form>
+{% endblock content %}
