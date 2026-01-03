@@ -16,7 +16,10 @@
         <th>DNS Zone</th>
         <th>Reverse Zone</th>
         <th>DHCP</th>
+        <th>Pool Start</th>
+        <th>Pool End</th>
         <th>PXE</th>
+        <th>Aktion</th>
       </tr>
     </thead>
     <tbody>
@@ -27,7 +30,10 @@
         <td>{{ s.dns_zone | default(value="") }}</td>
         <td>{{ s.reverse_zone | default(value="") }}</td>
         <td>{% if s.dhcp_enabled %}ja{% else %}nein{% endif %}</td>
+        <td>{{ s.dhcp_pool_start | default(value="") }}</td>
+        <td>{{ s.dhcp_pool_end | default(value="") }}</td>
         <td>{% if s.pxe_enabled %}ja{% else %}nein{% endif %}</td>
+        <td><a href="/subnets/{{ s.id }}/edit">Edit</a></td>
       </tr>
       {% endfor %}
     </tbody>
