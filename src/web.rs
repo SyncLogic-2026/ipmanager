@@ -1379,6 +1379,16 @@ async fn subnets_create(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    if dhcp_pool_start.is_some() ^ dhcp_pool_end.is_some() {
+        return render_subnets_new_error(
+            &state,
+            &session,
+            "Ungültige DHCP-Pool Range: Start und Ende müssen beide gesetzt sein oder beide leer sein.",
+        )
+        .await;
+    }
+
+
     let res = sqlx::query(
         "insert into subnets (name, cidr, dns_zone, reverse_zone, dhcp_enabled, pxe_enabled, dhcp_pool_start, dhcp_pool_end)
          values ($1, $2, $3, $4, $5, $6, $7::inet, $8::inet)",
@@ -1542,6 +1552,17 @@ async fn subnets_update(
         .as_deref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+
+    if dhcp_pool_start.is_some() ^ dhcp_pool_end.is_some() {
+        return render_subnets_edit_error(
+            &state,
+            &session,
+            id,
+            &form,
+            "Ungültige DHCP-Pool Range: Start und Ende müssen beide gesetzt sein oder beide leer sein.",
+        )
+        .await;
+    }
 
     let res = sqlx::query(
         "update subnets
