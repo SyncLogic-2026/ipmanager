@@ -468,7 +468,12 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
             let mut ctx = Context::new();
             add_auth_context(&mut ctx, &session).await;
             ctx.insert("error", &Some(format!("Deploy fehlgeschlagen: {e:#}")));
-            ctx.insert("kea_json", &"{}".to_string());
+
+            let kea_json = dhcp_kea::render_dhcp4_config(&state.pool)
+                .await
+                .unwrap_or_else(|_| "{}".to_string());
+            ctx.insert("kea_json", &kea_json);
+
             ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
             return render(&state.templates, "dhcp_kea.html", ctx);
         }
