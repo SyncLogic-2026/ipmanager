@@ -57,6 +57,9 @@ pub struct Config {
     pub kea_reload_mode: String,
     pub kea_control_agent_url: Option<Url>,
     pub kea_api_timeout: Duration,
+    pub kea_control_agent_username: Option<String>,
+    pub kea_control_agent_password: Option<String>,
+    pub kea_control_agent_config_test: bool,
 
     // Jobs (für später)
     pub job_poll_interval: Duration,
@@ -117,6 +120,7 @@ impl Config {
         let kea_reload_mode = env_default("KEA_RELOAD_MODE", "none");
         let kea_control_agent_url = match env_opt("KEA_CONTROL_AGENT_URL") {
             Some(s) => Some(Url::parse(&s).context("KEA_CONTROL_AGENT_URL must be a valid URL")?),
+
             None => None,
         };
         let kea_api_timeout =
@@ -124,6 +128,10 @@ impl Config {
 
         let job_poll_interval =
             env_duration_secs("JOB_POLL_INTERVAL_SECS").unwrap_or(Duration::from_secs(5));
+        let kea_control_agent_username = env_opt("KEA_CONTROL_AGENT_USERNAME");
+        let kea_control_agent_password = env_opt("KEA_CONTROL_AGENT_PASSWORD");
+        let kea_control_agent_config_test = env_bool("KEA_CONTROL_AGENT_CONFIG_TEST").unwrap_or(false);
+
         let job_max_retries = env_u32("JOB_MAX_RETRIES").unwrap_or(10);
         let job_backoff_base =
             env_duration_secs("JOB_BACKOFF_BASE_SECS").unwrap_or(Duration::from_secs(2));
@@ -164,15 +172,20 @@ impl Config {
 
             macmon_api_url,
             macmon_api_token,
+
             macmon_timeout,
 
             dhcp_config_path,
             dhcp_write_atomic,
 
+            // KEA
             kea_config_path,
             kea_reload_mode,
             kea_control_agent_url,
             kea_api_timeout,
+            kea_control_agent_username,
+            kea_control_agent_password,
+            kea_control_agent_config_test,
 
             job_poll_interval,
             job_max_retries,

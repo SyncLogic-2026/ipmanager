@@ -277,14 +277,15 @@ pub async fn deploy(pool: &PgPool, cfg: &Config) -> Result<DeployOutcome> {
     write_atomic(&cfg.kea_config_path, json.as_bytes()).context("failed to write kea config")?;
 
     let mode = cfg.kea_reload_mode.trim().to_lowercase();
+
     if mode == "api" {
-        let Some(url) = cfg.kea_control_agent_url.clone() else {
+        if cfg.kea_control_agent_url.is_none() {
             return Err(anyhow!(
                 "KEA_RELOAD_MODE=api but KEA_CONTROL_AGENT_URL is not set"
             ));
-        };
+        }
 
-        let (ok, msg) = reload_via_api(url.as_str(), cfg.kea_api_timeout).await;
+        let (ok, msg) = reload_via_api(cfg).await;
         return Ok(DeployOutcome {
             written_to: cfg.kea_config_path.clone(),
             reload_attempted: true,
@@ -352,7 +353,13 @@ fn write_atomic(path: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-async fn reload_via_api(url: &str, timeout: std::time::Duration) -> (bool, String) {
+async fn reload_via_api(cfg: &Config) -> (bool, String) {
+    let timeout = cfg.kea_api_timeout;
+    let url = match cfg.kea_control_agent_url.as_ref() {
+        Some(u) => u.as_str(),
+        None => return (false, "KEA_CONTROL_AGENT_URL is not set".to_string()),
+    };
+
     let body = serde_json::json!({
         "command": "config-reload",
         "service": ["dhcp4"]
@@ -363,7 +370,12 @@ async fn reload_via_api(url: &str, timeout: std::time::Duration) -> (bool, Strin
         Err(e) => return (false, format!("reqwest client build failed: {e}")),
     };
 
-    let resp = match client.post(url).json(&body).send().await {
+    let mut req = client.post(url).json(&body);
+    if let Some(user) = &cfg.kea_control_agent_username {
+        req = req.basic_auth(user, cfg.kea_control_agent_password.clone());
+    }
+
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => return (false, format!("request failed: {e}")),
     };
@@ -380,3 +392,4 @@ async fn reload_via_api(url: &str, timeout: std::time::Duration) -> (bool, Strin
 
     (true, text)
 }
+
