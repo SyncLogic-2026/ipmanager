@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net
 
 axum = "0.8"
 
-tower-sessions = "0.14"
+tower-sessions = { version = "0.14", features = ["signed"] }
 tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
 time = "0.3"
 
@@ -29,8 +29,10 @@ serde_json = "1"
 
 bcrypt = "0.15"
 sha2 = "0.10"
+cookie = { version = "0.18", features = ["key-expansion"] }
 
 ipnet = "2"
+ipnetwork = "0.20"
 
 tera = "1.20"
 

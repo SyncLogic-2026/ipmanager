@@ -12,10 +12,6 @@ pub enum MacParseError {
 }
 
 impl MacAddr {
-    pub fn bytes(&self) -> [u8; 6] {
-        self.0
-    }
-
     fn parse_hex_pair(a: u8, b: u8) -> Result<u8, MacParseError> {
         fn val(x: u8) -> Result<u8, MacParseError> {
             match x {
