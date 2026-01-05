@@ -5,10 +5,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ipnetwork::IpNetwork;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{net::IpAddr, str::FromStr, sync::Arc};
+use std::{net::Ipv4Addr, str::FromStr, sync::Arc};
 use tera::{Context, Tera};
 use tower_sessions::Session;
 use uuid::Uuid;
@@ -237,6 +238,24 @@ pub fn router(state: AppState) -> Router {
 }
 
 /* ----------------------------- Auth helpers ----------------------------- */
+
+fn validate_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
+    let candidate = if ip.contains('/') {
+        ip.to_string()
+    } else {
+        format!("{ip}/32")
+    };
+
+    match candidate.parse::<IpNetwork>() {
+        Ok(IpNetwork::V4(v4)) => Ok(v4.ip()),
+        Ok(IpNetwork::V6(_)) => Err("IPv6 wird nicht unterstützt".to_string()),
+        Err(_) => Err("Ungültige IP-Adresse".to_string()),
+    }
+}
+
+fn validate_mac(mac: &str) -> Result<MacAddr, String> {
+    MacAddr::from_str(mac.trim()).map_err(|_| "Ungültige MAC-Adresse".to_string())
+}
 
 async fn is_authenticated(session: &Session) -> bool {
     match session.get::<String>("username").await {
@@ -643,14 +662,14 @@ async fn hosts_create(
         return render_hosts_new_error(&state, &session, "Hostname darf nicht leer sein").await;
     }
 
-    let ip: IpAddr = match form.ip.trim().parse() {
+    let ip: Ipv4Addr = match validate_ipv4(form.ip.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, "Ungültige IP-Adresse").await,
+        Err(msg) => return render_hosts_new_error(&state, &session, &msg).await,
     };
 
-    let mac: MacAddr = match MacAddr::from_str(form.mac.trim()) {
+    let mac: MacAddr = match validate_mac(form.mac.trim()) {
         Ok(v) => v,
-        Err(_) => return render_hosts_new_error(&state, &session, "Ungültige MAC-Adresse").await,
+        Err(msg) => return render_hosts_new_error(&state, &session, &msg).await,
     };
     let mac_norm = mac.to_string();
 
@@ -668,6 +687,54 @@ async fn hosts_create(
         Ok(v) => v,
         Err(_) => return render_hosts_new_error(&state, &session, "Ungültiges Subnet").await,
     };
+
+    // IP muss im gewählten Subnet liegen
+    let cidr: Option<String> = match sqlx::query_scalar("select cidr::text from subnets where id = $1")
+        .bind(subnet_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(cidr) = cidr else {
+        return render_hosts_new_error(&state, &session, "Ungültiges Subnet").await;
+    };
+    let net: ipnet::Ipv4Net = match cidr.parse() {
+        Ok(n) => n,
+        Err(_) => return render_hosts_new_error(&state, &session, "Subnet CIDR ist ungültig").await,
+    };
+    if !net.contains(&ip) {
+        return render_hosts_new_error(&state, &session, "IP liegt nicht im gewählten Subnet").await;
+    }
+
+    // Vor dem Insert prüfen, ob Hostname/IP/MAC schon existieren
+    if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) = sqlx::query_as::<_, (String, String, String)>(
+        "select hostname, host(ip), mac
+         from hosts
+         where hostname = $1
+            or ip = $2
+            or mac = $3
+         limit 1",
+    )
+    .bind(&hostname)
+    .bind(ip.to_string())
+    .bind(&mac_norm)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        let msg = if conflict_host == hostname {
+            "Hostname ist bereits vergeben"
+        } else if conflict_ip == ip.to_string() {
+            "IP ist bereits vergeben"
+        } else if conflict_mac == mac_norm {
+            "MAC ist bereits vergeben"
+        } else {
+            "Hostname/IP/MAC ist bereits vergeben"
+        };
+        return render_hosts_new_error(&state, &session, msg).await;
+    }
+
 
     let pxe_enabled = form.pxe_enabled.is_some();
 
@@ -872,19 +939,17 @@ async fn host_update(
         .await;
     }
 
-    let ip: IpAddr = match form.ip.trim().parse() {
+    let ip: Ipv4Addr = match validate_ipv4(form.ip.trim()) {
         Ok(v) => v,
-        Err(_) => {
-            return render_host_edit_error(&state, &session, id, &form, "Ungültige IP-Adresse")
-                .await
+        Err(msg) => {
+            return render_host_edit_error(&state, &session, id, &form, &msg).await;
         }
     };
 
-    let mac: MacAddr = match MacAddr::from_str(form.mac.trim()) {
+    let mac: MacAddr = match validate_mac(form.mac.trim()) {
         Ok(v) => v,
-        Err(_) => {
-            return render_host_edit_error(&state, &session, id, &form, "Ungültige MAC-Adresse")
-                .await
+        Err(msg) => {
+            return render_host_edit_error(&state, &session, id, &form, &msg).await;
         }
     };
     let mac_norm = mac.to_string();
@@ -909,6 +974,55 @@ async fn host_update(
             return render_host_edit_error(&state, &session, id, &form, "Ungültiges Subnet").await
         }
     };
+
+
+    // IP muss im gewählten Subnet liegen
+    let cidr: Option<String> = match sqlx::query_scalar("select cidr::text from subnets where id = $1")
+        .bind(subnet_id)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(cidr) = cidr else {
+        return render_host_edit_error(&state, &session, id, &form, "Ungültiges Subnet").await;
+    };
+    let net: ipnet::Ipv4Net = match cidr.parse() {
+        Ok(n) => n,
+        Err(_) => return render_host_edit_error(&state, &session, id, &form, "Subnet CIDR ist ungültig").await,
+    };
+    if !net.contains(&ip) {
+        return render_host_edit_error(&state, &session, id, &form, "IP liegt nicht im gewählten Subnet").await;
+    }
+
+    // Vor dem Update prüfen, ob Hostname/IP/MAC schon existieren (anderer Datensatz)
+    if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
+        sqlx::query_as::<_, (String, String, String)>(
+            "select hostname, host(ip), mac
+             from hosts
+             where id <> $1
+               and (hostname = $2 or ip = $3 or mac = $4)
+             limit 1",
+        )
+        .bind(id)
+        .bind(&hostname)
+        .bind(ip.to_string())
+        .bind(&mac_norm)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        let msg = if conflict_host == hostname {
+            "Hostname ist bereits vergeben"
+        } else if conflict_ip == ip.to_string() {
+            "IP ist bereits vergeben"
+        } else if conflict_mac == mac_norm {
+            "MAC ist bereits vergeben"
+        } else {
+            "Hostname/IP/MAC ist bereits vergeben"
+        };
+        return render_host_edit_error(&state, &session, id, &form, msg).await;
+    }
 
     let pxe_enabled = form.pxe_enabled.is_some();
 
@@ -1837,4 +1951,30 @@ async fn render_host_edit_error(
     ctx.insert("subnets", &subnets);
 
     render(&state.templates, "host_edit.html", ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_ipv4, validate_mac};
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn validate_ipv4_accepts_plain_address() {
+        let ip = validate_ipv4("192.168.1.10").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 10));
+    }
+
+    #[test]
+    fn validate_ipv4_rejects_invalid_and_ipv6() {
+        assert!(validate_ipv4("256.256.0.1").is_err());
+        assert!(validate_ipv4("2001:db8::1").is_err());
+    }
+
+    #[test]
+    fn validate_mac_normalizes_and_rejects_bad() {
+        let mac = validate_mac("AA:bb:CC:dd:EE:ff").unwrap();
+        assert_eq!(mac.to_string(), "aa:bb:cc:dd:ee:ff");
+        assert!(validate_mac("001A2B3C4D5E").is_ok()); // plain hex is allowed by parser
+        assert!(validate_mac("ZZ:11:22:33:44:55").is_err());
+    }
 }

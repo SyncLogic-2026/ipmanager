@@ -31,9 +31,11 @@ async fn main() -> Result<()> {
     let store = tower_sessions_sqlx_store::PostgresStore::new(pool.clone());
     store.migrate().await?;
 
+    let key = tower_sessions::cookie::Key::derive_from(cfg.session_secret.as_bytes());
     let session_layer = tower_sessions::SessionManagerLayer::new(store)
         .with_secure(cfg.session_cookie_secure)
         .with_name(cfg.session_cookie_name.clone())
+        .with_signed(key)
         .with_expiry(tower_sessions::Expiry::OnInactivity(
             time::Duration::seconds(cfg.session_ttl.as_secs() as i64),
         ));
