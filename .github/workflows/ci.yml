@@ -6,7 +6,8 @@ on:
     branches: [ main ]
 
 jobs:
-  CI/rust:
+  rust:
+    name: CI/rust
     runs-on: ubuntu-latest
     services:
       postgres:
