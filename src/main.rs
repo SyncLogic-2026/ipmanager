@@ -1,58 +1,68 @@
-mod config;
-mod db;
-mod dhcp_kea;
-mod domain;
-mod web;
+use anyhow::{Context, Result};
+use ipnetwork::IpNetwork;
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
+use std::process::Command;
 
-use anyhow::Result;
-use tracing_subscriber::EnvFilter;
+const DNSMASQ_CONF_PATH: &str = "/etc/dnsmasq.d/01-rust-managed.conf";
+
+#[derive(Debug, FromRow)]
+struct Host {
+    mac_address: String,
+    ip_address: IpNetwork,
+    hostname: Option<String>,
+}
+
+async fn sync_dnsmasq_hosts(pool: &PgPool) -> Result<()> {
+    let hosts: Vec<Host> = sqlx::query_as(
+        "SELECT mac_address, ip_address, hostname FROM hosts",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to fetch hosts from database")?;
+
+    let mut output = String::new();
+    for host in hosts {
+        let hostname = host.hostname.as_deref().unwrap_or("");
+        output.push_str(&format!(
+            "dhcp-host={},{},{},infinite\n",
+            host.mac_address,
+            host.ip_address.ip(),
+            hostname
+        ));
+    }
+
+    tokio::fs::write(DNSMASQ_CONF_PATH, output)
+        .await
+        .with_context(|| format!("failed to write dnsmasq config to {DNSMASQ_CONF_PATH}"))?;
+
+    let status = Command::new("sudo")
+        .arg("systemctl")
+        .arg("restart")
+        .arg("dnsmasq")
+        .status()
+        .context("failed to restart dnsmasq via systemctl")?;
+
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "dnsmasq restart failed with status: {status}"
+        ));
+    }
+
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    dotenvy::dotenv().ok();
 
-    let cfg = config::Config::from_env()?;
-    tracing::info!(
-        bind_addr = %cfg.bind_addr,
-        base_url = %cfg.base_url,
-        db_max_connections = cfg.db_max_connections,
-        db_min_connections = cfg.db_min_connections,
-        "config loaded"
-    );
+    let database_url = std::env::var("DATABASE_URL")
+        .context("DATABASE_URL is not set")?;
 
-    let pool = db::connect(&cfg).await?;
-    tracing::info!("database connected");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .context("failed to connect to PostgreSQL")?;
 
-    db::ensure_initial_admin(&cfg, &pool).await?;
-
-    // Sessions store init (wie bisher)
-    let store = tower_sessions_sqlx_store::PostgresStore::new(pool.clone());
-    store.migrate().await?;
-
-    let key = tower_sessions::cookie::Key::derive_from(cfg.session_secret.as_bytes());
-    let session_layer = tower_sessions::SessionManagerLayer::new(store)
-        .with_secure(cfg.session_cookie_secure)
-        .with_name(cfg.session_cookie_name.clone())
-        .with_signed(key)
-        .with_expiry(tower_sessions::Expiry::OnInactivity(
-            time::Duration::seconds(cfg.session_ttl.as_secs() as i64),
-        ));
-
-    // Templates
-    let tera = tera::Tera::new("templates/**/*")?;
-
-    let state = web::AppState {
-        pool,
-        templates: std::sync::Arc::new(tera),
-        config: cfg.clone(),
-    };
-
-    let app = web::router(state).layer(session_layer);
-
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr).await?;
-    tracing::info!(addr = %cfg.bind_addr, "listening");
-    axum::serve(listener, app).await?;
-
-    Ok(())
+    sync_dnsmasq_hosts(&pool).await
 }
