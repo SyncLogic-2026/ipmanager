@@ -9,13 +9,20 @@ use ipnet::IpNet;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
-use std::{collections::HashSet, net::Ipv4Addr, path::Path as StdPath, str::FromStr, sync::Arc};
+use std::{
+    collections::HashSet,
+    net::Ipv4Addr,
+    path::Path as StdPath,
+    str::FromStr,
+    sync::Arc,
+};
 use tera::{Context, Tera};
 use tower_sessions::Session;
 use uuid::Uuid;
 
+use crate::dhcp::dnsmasq;
 use crate::domain::mac::MacAddr;
-use crate::{config::Config, dhcp_kea};
+use crate::config::Config;
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
@@ -282,9 +289,9 @@ pub fn router(state: AppState) -> Router {
         .route("/subnets/new", get(subnets_new))
         .route("/subnets/{id}/edit", get(subnets_edit))
         .route("/subnets/{id}", post(subnets_update))
-        // Kea DHCP
-        .route("/dhcp/kea", get(dhcp_kea_page))
-        .route("/dhcp/kea/deploy", post(dhcp_kea_deploy))
+        // dnsmasq DHCP
+        .route("/dhcp/dnsmasq", get(dhcp_dnsmasq_page))
+        .route("/dhcp/dnsmasq/deploy", post(dhcp_dnsmasq_deploy))
         // PXE / iPXE
         .route("/boot.ipxe", get(boot_ipxe))
         // API
@@ -433,7 +440,6 @@ async fn add_auth_context(ctx: &mut Context, session: &Session, state: &AppState
 }
 
 async fn get_dhcp_leases(_subnet_id: Uuid, _state: &AppState) -> Result<Vec<Ipv4Addr>, String> {
-    // TODO: Kea-API anbinden; bis dahin leere Liste (keine bekannten Leases)
     tracing::debug!("get_dhcp_leases stub invoked; returning empty list");
     Ok(Vec::new())
 }
@@ -691,9 +697,17 @@ async fn me_page(State(state): State<AppState>, session: Session) -> Response {
     render(&state.templates, "me.html", ctx)
 }
 
-/* ----------------------------- Kea DHCP (SSR) ----------------------------- */
+/* ----------------------------- dnsmasq DHCP (SSR) ----------------------------- */
 
-async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Response {
+async fn try_sync_dnsmasq(state: &AppState, context: &str) {
+    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(&state.pool, &state.config).await {
+        tracing::error!(error = ?e, %context, "dnsmasq sync failed");
+    } else {
+        tracing::info!(%context, "dnsmasq sync completed");
+    }
+}
+
+async fn dhcp_dnsmasq_page(State(state): State<AppState>, session: Session) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
     }
@@ -707,34 +721,42 @@ async fn dhcp_kea_page(State(state): State<AppState>, session: Session) -> Respo
                 "error",
                 &Some(format!("Config konnte nicht geladen werden: {e:#}")),
             );
-            ctx.insert("kea_json", &"{}".to_string());
-            ctx.insert("kea_reload_mode", &"none".to_string());
-            return render(&state.templates, "dhcp_kea.html", ctx);
+            ctx.insert("hosts_preview", &"".to_string());
+            ctx.insert("dnsmasq_hosts_file", &"".to_string());
+            ctx.insert("dnsmasq_reload_cmd", &"".to_string());
+            return render(&state.templates, "dhcp_dnsmasq.html", ctx);
         }
     };
 
-    let kea_json = match dhcp_kea::render_dhcp4_config(&state.pool, &cfg).await {
-        Ok(j) => j,
+    let hosts_preview = match tokio::fs::read_to_string(&cfg.dnsmasq_hosts_file).await {
+        Ok(contents) => contents,
         Err(e) => {
             let mut ctx = Context::new();
             add_auth_context(&mut ctx, &session, &state).await;
-            ctx.insert("error", &Some(format!("Render fehlgeschlagen: {e:#}")));
-            ctx.insert("kea_json", &"{}".to_string());
-            ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
-            return render(&state.templates, "dhcp_kea.html", ctx);
+            ctx.insert(
+                "error",
+                &Some(format!(
+                    "Hosts-Datei konnte nicht gelesen werden: {e:#}"
+                )),
+            );
+            ctx.insert("hosts_preview", &"".to_string());
+            ctx.insert("dnsmasq_hosts_file", &cfg.dnsmasq_hosts_file);
+            ctx.insert("dnsmasq_reload_cmd", &cfg.dnsmasq_reload_cmd);
+            return render(&state.templates, "dhcp_dnsmasq.html", ctx);
         }
     };
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
-    ctx.insert("kea_json", &kea_json);
-    ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
+    ctx.insert("hosts_preview", &hosts_preview);
+    ctx.insert("dnsmasq_hosts_file", &cfg.dnsmasq_hosts_file);
+    ctx.insert("dnsmasq_reload_cmd", &cfg.dnsmasq_reload_cmd);
 
-    render(&state.templates, "dhcp_kea.html", ctx)
+    render(&state.templates, "dhcp_dnsmasq.html", ctx)
 }
 
-async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Response {
+async fn dhcp_dnsmasq_deploy(State(state): State<AppState>, session: Session) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
     }
@@ -742,56 +764,43 @@ async fn dhcp_kea_deploy(State(state): State<AppState>, session: Session) -> Res
     let cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(error = ?e, "failed to load config for kea deploy");
+            tracing::error!(error = ?e, "failed to load config for dnsmasq deploy");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
 
-    let outcome = match dhcp_kea::deploy(&state.pool, &cfg).await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(error = ?e, "kea deploy failed");
+    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(&state.pool, &cfg).await {
+        tracing::error!(error = ?e, "dnsmasq deploy failed");
 
-            let mut ctx = Context::new();
-            add_auth_context(&mut ctx, &session, &state).await;
-            ctx.insert("error", &Some(format!("Deploy fehlgeschlagen: {e:#}")));
+        let mut ctx = Context::new();
+        add_auth_context(&mut ctx, &session, &state).await;
+        ctx.insert("error", &Some(format!("Deploy fehlgeschlagen: {e:#}")));
+        ctx.insert("hosts_preview", &"".to_string());
+        ctx.insert("dnsmasq_hosts_file", &cfg.dnsmasq_hosts_file);
+        ctx.insert("dnsmasq_reload_cmd", &cfg.dnsmasq_reload_cmd);
+        return render(&state.templates, "dhcp_dnsmasq.html", ctx);
+    }
 
-            let kea_json = dhcp_kea::render_dhcp4_config(&state.pool, &cfg)
-                .await
-                .unwrap_or_else(|_| "{}".to_string());
-            ctx.insert("kea_json", &kea_json);
-
-            ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
-            return render(&state.templates, "dhcp_kea.html", ctx);
-        }
-    };
-
-    let kea_json = dhcp_kea::render_dhcp4_config(&state.pool, &cfg)
+    let hosts_preview = tokio::fs::read_to_string(&cfg.dnsmasq_hosts_file)
         .await
-        .unwrap_or_else(|_| "{}".to_string());
+        .unwrap_or_default();
 
     let mut ctx = Context::new();
     add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("error", &Option::<String>::None);
-    ctx.insert("kea_json", &kea_json);
-    ctx.insert("kea_reload_mode", &cfg.kea_reload_mode);
-    let reload_status = match outcome.reload_ok {
-        Some(true) => "ok",
-        Some(false) => "failed",
-        None => "not-attempted",
-    };
-
+    ctx.insert("hosts_preview", &hosts_preview);
+    ctx.insert("dnsmasq_hosts_file", &cfg.dnsmasq_hosts_file);
+    ctx.insert("dnsmasq_reload_cmd", &cfg.dnsmasq_reload_cmd);
     ctx.insert(
         "outcome",
         &serde_json::json!({
-            "written_to": outcome.written_to,
-            "reload_attempted": outcome.reload_attempted,
-            "reload_status": reload_status,
-            "reload_message": outcome.reload_message
+            "written_to": cfg.dnsmasq_hosts_file,
+            "reload_status": "ok",
+            "reload_message": ""
         }),
     );
 
-    render(&state.templates, "dhcp_kea.html", ctx)
+    render(&state.templates, "dhcp_dnsmasq.html", ctx)
 }
 
 /* ----------------------------- Hosts (SSR) ----------------------------- */
@@ -1208,6 +1217,7 @@ async fn hosts_create(
                 rows_affected = r.rows_affected(),
                 "Inserted host into database"
             );
+            try_sync_dnsmasq(&state, "hosts_create").await;
             Redirect::to("/hosts").into_response()
         }
         Err(e) => {
@@ -1592,6 +1602,7 @@ async fn host_update(
             if r.rows_affected() == 0 {
                 StatusCode::NOT_FOUND.into_response()
             } else {
+                try_sync_dnsmasq(&state, "hosts_update").await;
                 Redirect::to(&format!("/hosts/{}", id)).into_response()
             }
         }
@@ -1632,6 +1643,7 @@ async fn host_delete(
             if r.rows_affected() == 0 {
                 StatusCode::NOT_FOUND.into_response()
             } else {
+                try_sync_dnsmasq(&state, "hosts_delete").await;
                 Redirect::to("/hosts").into_response()
             }
         }
@@ -3285,12 +3297,8 @@ mod tests {
             pxe_tftp_server: "192.0.2.1".to_string(),
             pxe_bios_bootfile: "undionly.kpxe".to_string(),
             pxe_uefi_bootfile: "ipxe.efi".to_string(),
-            kea_config_path: "/etc/kea/kea-dhcp4.conf".to_string(),
-            kea_reload_mode: "none".to_string(),
-            kea_control_agent_url: None,
-            kea_api_timeout: Duration::from_secs(5),
-            kea_control_agent_username: None,
-            kea_control_agent_password: None,
+            dnsmasq_hosts_file: "/etc/dnsmasq.d/01-rust-hosts.conf".to_string(),
+            dnsmasq_reload_cmd: "sudo systemctl kill -s SIGHUP dnsmasq".to_string(),
         }
     }
 

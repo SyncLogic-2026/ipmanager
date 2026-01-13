@@ -32,14 +32,9 @@ pub struct Config {
     pub pxe_bios_bootfile: String,
     pub pxe_uefi_bootfile: String,
 
-    // KEA (neu)
-    pub kea_config_path: String,
-    /// "none" | "api"
-    pub kea_reload_mode: String,
-    pub kea_control_agent_url: Option<Url>,
-    pub kea_api_timeout: Duration,
-    pub kea_control_agent_username: Option<String>,
-    pub kea_control_agent_password: Option<String>,
+    // dnsmasq
+    pub dnsmasq_hosts_file: String,
+    pub dnsmasq_reload_cmd: String,
 }
 
 impl Config {
@@ -74,19 +69,11 @@ impl Config {
         let pxe_bios_bootfile = env_default("PXE_BIOS_BOOTFILE", "undionly.kpxe");
         let pxe_uefi_bootfile = env_default("PXE_UEFI_BOOTFILE", "ipxe.efi");
 
-        // KEA
-        let kea_config_path = env_default("KEA_CONFIG_PATH", "/etc/kea/kea-dhcp4.conf");
-        let kea_reload_mode = env_default("KEA_RELOAD_MODE", "none");
-        let kea_control_agent_url = match env_opt("KEA_CONTROL_AGENT_URL") {
-            Some(s) => Some(Url::parse(&s).context("KEA_CONTROL_AGENT_URL must be a valid URL")?),
-
-            None => None,
-        };
-        let kea_api_timeout =
-            env_duration_secs("KEA_API_TIMEOUT_SECS").unwrap_or(Duration::from_secs(5));
-
-        let kea_control_agent_username = env_opt("KEA_CONTROL_AGENT_USERNAME");
-        let kea_control_agent_password = env_opt("KEA_CONTROL_AGENT_PASSWORD");
+        // dnsmasq
+        let dnsmasq_hosts_file =
+            env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
+        let dnsmasq_reload_cmd =
+            env_default("DNSMASQ_RELOAD_CMD", "sudo systemctl kill -s SIGHUP dnsmasq");
 
         Ok(Self {
             database_url,
@@ -111,13 +98,9 @@ impl Config {
             pxe_bios_bootfile,
             pxe_uefi_bootfile,
 
-            // KEA
-            kea_config_path,
-            kea_reload_mode,
-            kea_control_agent_url,
-            kea_api_timeout,
-            kea_control_agent_username,
-            kea_control_agent_password,
+            // dnsmasq
+            dnsmasq_hosts_file,
+            dnsmasq_reload_cmd,
         })
     }
 }
@@ -128,17 +111,6 @@ fn env(key: &str) -> Result<String> {
 
 fn env_default(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_opt(key: &str) -> Option<String> {
-    std::env::var(key).ok().and_then(|s| {
-        let t = s.trim().to_string();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
-    })
 }
 
 fn env_u32(key: &str) -> Option<u32> {

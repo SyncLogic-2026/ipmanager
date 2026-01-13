@@ -1,42 +1,59 @@
-# Architektur: SyncLogic IP-Manager
+# Architektur-Dokumentation: IPManager (SyncLogic-2026)
 
-Diese Dokumentation beschreibt die Systemstruktur des IP-Managers zur automatisierten Verwaltung von DHCP-Reservierungen und IP-Adressbeständen.
+## 1. Übersicht
 
-## 1. Übersicht der Komponenten
+Der IPManager ist ein IP-Management-System (IPAM), das als "Source of Truth" für Netzwerkressourcen dient. Die Anwendung verwaltet Hosts, Subnetze und PXE-Boot-Konfigurationen in einer PostgreSQL-Datenbank und synchronisiert diese mit dem **dnsmasq** DHCP-Backend.
 
-Das System besteht aus drei Hauptschichten:
+## 2. Kernkomponenten
 
-* **Persistenzschicht (PostgreSQL):** Speichert die "Source of Truth". Hier liegen Subnetz-Definitionen, vergebene IP-Adressen, MAC-Adressen und Hostnamen.
-* **Logikschicht (Rust Backend):** Das Herzstück des Projekts. Es validiert IP-Adressbereiche, verwaltet die Datenbanktransaktionen und generiert die Konfigurationsdateien für den DHCP-Dienst.
-* **Infrastrukturschicht (dnsmasq):** Ein leichtgewichtiger, stabiler DHCP- und DNS-Server, der die vom Backend generierten statischen Zuweisungen im Netzwerk umsetzt.
+### 2.1 Backend (Rust & Axum)
 
-## 2. Datenfluss und Synchronisation
+Das Herzstück der Anwendung ist in Rust geschrieben.
 
-Der Prozess der Adressvergabe ist strikt unidirektional (Database-First), um Inkonsistenzen zu vermeiden:
+* **Web-Server:** Axum verarbeitet REST-Anfragen und rendert HTML-Templates (Tera).
+* **Datenbank-Layer:** SQLx (v0.8) wird für asynchrone PostgreSQL-Abfragen genutzt.
+* **DHCP-Modul:** Ein dediziertes Modul (`src/dhcp/dnsmasq.rs`) transformiert den Datenbank-State in dnsmasq-kompatible Konfigurationen.
 
-1. **Manipulation:** Ein Administrator fügt über den `ipmanager` (CLI oder API) einen neuen Host hinzu.
-2. **Validierung & Speicherung:** Rust prüft die Korrektheit (z. B. IP im richtigen Subnetz, MAC-Format) und schreibt die Daten in die **PostgreSQL**-Datenbank.
-3. **Export:** Ein Trigger oder ein periodischer Job im Backend liest die aktiven Reservierungen aus Postgres und erzeugt eine flache Konfigurationsdatei: `/etc/dnsmasq.d/01-rust-managed.conf`.
-4. **Aktivierung:** Das Backend sendet ein Signal an das Betriebssystem (`systemctl reload dnsmasq` oder `SIGHUP`), damit dnsmasq die Datei ohne Verbindungsabbruch neu einliest.
+### 2.2 Source of Truth (PostgreSQL)
 
-## 3. Dateibasierte Integration (dnsmasq)
+Alle Daten (MAC-Adressen, IP-Reservierungen, Hostnames, PXE-Images) liegen in PostgreSQL. Es findet keine dauerhafte Speicherung von Zuständen im DHCP-Server selbst statt; dieser wird bei jeder Änderung neu provisioniert.
 
-Anstelle einer komplexen API nutzt das System das bewährte `conf-dir`-Prinzip von dnsmasq.
+### 2.3 DHCP-Backend (dnsmasq)
 
-* **Hauptvorteil:** Hohe Robustheit. Selbst wenn das Rust-Backend offline ist, vergibt dnsmasq weiterhin die zuletzt bekannten IP-Adressen.
-* **Sicherheit:** Das Backend benötigt lediglich Schreibrechte für ein spezifisches Verzeichnis in `/etc/dnsmasq.d/`, was die Angriffsfläche im Vergleich zu einem vollumfänglichen DHCP-Root-Dienst minimiert.
+Als DHCP-Server wird **dnsmasq** eingesetzt.
 
-## 4. Technologie-Stack
+* **Konfiguration:** Erfolgt über eine dedizierte Datei unter `/etc/dnsmasq.d/01-rust-hosts.conf`.
+* **Format:** `dhcp-host=MAC,IP,HOSTNAME`.
+* **Synchronisation:** Das Rust-Backend schreibt die Datei atomar und sendet ein `SIGHUP`-Signal an den dnsmasq-Prozess, um die Änderungen ohne Dienstunterbrechung zu laden.
 
-| Komponente | Technologie | Grund der Wahl |
-| --- | --- | --- |
-| **Datenbank** | PostgreSQL | Robuste Datentypen für Netzwerke (`inet`, `macaddr`), hohe Integrität. |
-| **Backend** | Rust (Tokio, SQLx) | Speichersicherheit, hohe Performance, exzellente SQL-Integration. |
-| **DHCP-Dienst** | dnsmasq | Extrem stabil, einfacher Datei-Sync, geringer Overhead gegenüber Kea. |
-| **Betriebssystem** | Ubuntu 24.04 | Aktuelle Kernel-Features und stabile Paketbasis. |
+## 3. Datenfluss & Synchronisation
+
+### 3.1 Schreibvorgang (CRUD)
+
+1. Der Nutzer ändert eine Host-Reservierung im Web-UI.
+2. Das Backend validiert die Eingabe (IPv4-Format, Duplikatsprüfung).
+3. Die Änderung wird in der PostgreSQL-Datenbank persistiert.
+4. **Trigger:** Nach erfolgreichem Commit wird `sync_dnsmasq_hosts()` aufgerufen.
+5. Die Konfigurationsdatei wird neu generiert und geschrieben.
+6. Ein `systemctl kill -s SIGHUP dnsmasq` wird ausgeführt.
+
+### 3.2 PXE-Boot-Prozess
+
+1. Ein Client startet via PXE/iPXE.
+2. dnsmasq weist eine IP zu und verweist auf den TFTP-Server (Bootfile).
+3. Der iPXE-Bootloader lädt das dynamische Menü von `/boot.ipxe` (Axum-Endpoint).
+4. Das Menü wird in Echtzeit aus der Datenbank generiert.
+
+## 4. Sicherheitskonzept
+
+* **Berechtigungen:** Das Rust-Backend läuft unter einem eingeschränkten System-User.
+* **Sudoers:** Ein spezifischer Sudoers-Eintrag erlaubt nur den Befehl `systemctl kill -s SIGHUP dnsmasq` ohne Passwort.
+* **Validierung:** Strikte Typenprüfung (ipnetwork crate) verhindert fehlerhafte DHCP-Einträge.
 
 ## 5. Deployment-Struktur
 
-* **Konfigurationspfad:** `/etc/dnsmasq.d/`
-* **Export-Format:** `dhcp-host=AA:BB:CC:DD:EE:FF,10.0.0.1,hostname`
-* **Service-Management:** Systemd (`isc-kea` wurde vollständig durch `dnsmasq` ersetzt).
+```text
+/etc/dnsmasq.conf           <-- Globale Einstellungen
+/etc/dnsmasq.d/
+    ├── 00-global.conf      <-- Statische Netzwerkeinstellungen
+    └── 01-rust-hosts.conf  <-- Von IPManager generierte Leases
