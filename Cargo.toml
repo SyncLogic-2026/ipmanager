@@ -14,14 +14,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 tokio = { version = "1", features = ["full"] }
 
-axum = "0.8"
+axum = "0.7"
 
-tower-sessions = { version = "0.14", features = ["signed"] }
+tower-sessions = { version = "0.13", features = ["signed"] }
 tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
 time = "0.3"
 tower-http = { version = "0.6", features = ["fs"] }
 
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "macros", "ipnetwork"] }
+sqlx = { version = "0.8.0", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "chrono", "ipnetwork"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -37,7 +37,6 @@ ipnetwork = "0.20"
 
 tera = "1.20"
 
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 html-escape = "0.2"
 
 [dev-dependencies]

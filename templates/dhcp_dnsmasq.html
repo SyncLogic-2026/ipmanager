@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}dnsmasq Hosts-Export{% endblock title %}
+
+{% block content %}
+<h1>dnsmasq Hosts-Export</h1>
+
+<p>Generiert eine <code>dnsmasq</code>-Hosts-Datei aus der Datenbank und sendet ein Reload-Signal.</p>
+<p><strong>Hosts-Datei:</strong> {{ dnsmasq_hosts_file }}</p>
+<p><strong>Reload-Command:</strong> {{ dnsmasq_reload_cmd }}</p>
+
+{% if error %}
+<p style="color: red;">{{ error }}</p>
+{% endif %}
+
+{% if outcome %}
+<h2>Deploy Ergebnis</h2>
+<ul>
+  <li><strong>Datei:</strong> {{ outcome.written_to }}</li>
+  <li><strong>Reload Status:</strong>
+    {% if outcome.reload_status == "ok" %}
+      ok
+    {% else %}
+      fehlgeschlagen
+    {% endif %}
+  </li>
+</ul>
+
+{% if outcome.reload_message %}
+<h3>Reload Ausgabe</h3>
+<pre>{{ outcome.reload_message }}</pre>
+{% endif %}
+{% endif %}
+
+<form method="post" action="/dhcp/dnsmasq/deploy">
+  <button type="submit">Deploy</button>
+</form>
+
+<h2>Preview</h2>
+<pre style="white-space: pre-wrap;">{{ hosts_preview }}</pre>
+{% endblock content %}

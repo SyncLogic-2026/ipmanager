@@ -1,7 +1,7 @@
 ````markdown
-# IPManager – IP-Management & Kea DHCP Control (PostgreSQL, Rust/Axum) inkl. PXE/iPXE-Menü
+# IPManager – IP-Management & dnsmasq DHCP Control (PostgreSQL, Rust/Axum) inkl. PXE/iPXE-Menü
 
-IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-relevanten Daten in PostgreSQL sowie zur Generierung/Deploy von Kea DHCPv4-Konfigurationen. Zusätzlich bietet IPManager ein PXE/iPXE-Boot-Menü, das dynamisch aus der Datenbank erzeugt wird und Boot-Images per Web-UI verwaltbar macht.
+IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-relevanten Daten in PostgreSQL sowie zur Generierung/Deploy einer dnsmasq-Hosts-Datei. Zusätzlich bietet IPManager ein PXE/iPXE-Boot-Menü, das dynamisch aus der Datenbank erzeugt wird und Boot-Images per Web-UI verwaltbar macht.
 
 ## Features
 
@@ -18,12 +18,9 @@ IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-rel
   - Duplicate-Checks (Hostname/IP/MAC) vor DB-Schreiboperationen
 - Unit-Tests + optionale Integrationstests gegen echte PostgreSQL-DB
 
-### Kea DHCPv4 Integration
-- Generierung einer Kea DHCPv4 JSON-Konfiguration aus DB/Config
-- PXE/iPXE Bootfile-Logik über globale `client-classes`:
-  - iPXE Clients → erhalten direkt `boot.ipxe` (HTTP)
-  - UEFI x86_64 → erhalten UEFI-iPXE Bootfile via TFTP
-  - BIOS (Catch-all) → erhalten BIOS-iPXE Bootfile via TFTP
+### dnsmasq Integration
+- Generierung einer dnsmasq-Hosts-Datei aus DB/Config
+- Dateibasierter Sync mit Reload via SIGHUP/Command
 
 ### PXE/iPXE Boot Menü
 - Web-UI CRUD für PXE-Images (Linux/Chain)
@@ -37,7 +34,7 @@ IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-rel
 
 - Rust Toolchain (stable) + Cargo
 - PostgreSQL
-- (Optional) Kea DHCP Server für produktiven Betrieb
+- (Optional) dnsmasq für produktiven DHCP-Betrieb
 - (Optional) TFTP Server / Bereitstellung von iPXE-Binaries (BIOS/UEFI), wenn PXE genutzt wird
 
 ---
@@ -47,7 +44,7 @@ IPManager ist eine Webanwendung zur Verwaltung von Hosts, Subnetzen und DHCP-rel
 - `main.rs` – Router/Server-Setup, Session-Layer, Static Serving (PXE Assets)
 - `config.rs` – Laden der Konfiguration aus Environment
 - `web.rs` – Webhandler/Validierungen/CRUD
-- `dhcp_kea.rs` – Kea DHCPv4 JSON Generator (inkl. PXE client-classes)
+- `dhcp_dnsmasq.rs` – dnsmasq Hosts-Export
 - `migrations/` – SQL Migrationen (inkl. PXE-Images Tabelle)
 - `templates/` – Tera Templates (inkl. PXE UI)
 
@@ -78,7 +75,7 @@ IPManager wird über Environment Variablen konfiguriert. Verwende eine `.env` Da
 - `PXE_HTTP_BASE_URL`
   - Basis-URL, unter der `/pxe-assets` erreichbar ist (z.B. `http://ipmanager:8080/pxe-assets`)
 - `PXE_TFTP_SERVER`
-  - IP/Hostname des TFTP-Servers (für Kea next-server / Bootloader-Download)
+  - IP/Hostname des TFTP-Servers (für DHCP next-server / Bootloader-Download)
 - `PXE_BIOS_BOOTFILE`
   - Bootfile für BIOS (z.B. `undionly.kpxe` oder `ipxe.pxe`)
 - `PXE_UEFI_BOOTFILE`
@@ -199,29 +196,6 @@ Validierung (serverseitig):
   * iPXE shell
   * alle `enabled` PXE-Images aus DB
 
-### 5) Kea DHCP: PXE/iPXE Bootfile-Logik
-
-Wenn `PXE_ENABLED=true`, erzeugt der Kea-Generator globale `client-classes`:
-
-* `ipxe`:
-
-  * Match: Vendor-Class iPXE
-  * boot-file-name: `boot.ipxe` URL (HTTP)
-* `uefi_x64`:
-
-  * Match: `option[93].hex == 0x0009`
-  * next-server: `PXE_TFTP_SERVER`
-  * boot-file-name: `PXE_UEFI_BOOTFILE`
-* `bios`:
-
-  * Catch-all
-  * next-server: `PXE_TFTP_SERVER`
-  * boot-file-name: `PXE_BIOS_BOOTFILE`
-
-Wichtig:
-
-* Reihenfolge der Klassen ist so gesetzt, dass iPXE immer gewinnt, wenn iPXE bereits läuft.
-
 ---
 
 ## Beispiel: iPXE Menü-Ausschnitt
@@ -263,7 +237,6 @@ chain https://example.org/rescue.ipxe
 
 * Prüfe, ob `PXE_ENABLED=true` gesetzt ist
 * Prüfe, ob `/boot.ipxe` erreichbar ist
-* Prüfe Kea-Konfiguration: client-classes vorhanden?
 * Prüfe iPXE Vendor-Class:
 
   * In iPXE sollte Vendor-Class „iPXE“ sein (damit die `ipxe` class greift)
