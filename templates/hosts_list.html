@@ -3,6 +3,14 @@
 {% block content %}
 <h1>Hosts</h1>
 
+{% if dnsmasq_message %}
+  {% if dnsmasq_status == "warn" %}
+    <p style="color: #9a4b00;">{{ dnsmasq_message }}</p>
+  {% else %}
+    <p style="color: #1f6f2a;">{{ dnsmasq_message }}</p>
+  {% endif %}
+{% endif %}
+
 <p><a href="/hosts/new">Neuen Host anlegen</a></p>
 
 <form method="get" action="/hosts" style="margin: 12px 0;">

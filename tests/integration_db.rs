@@ -37,7 +37,9 @@ async fn host_duplicate_is_rejected() -> anyhow::Result<()> {
             .fetch_one(&mut *tx)
             .await?;
 
-    sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
+    sqlx::query(
+        "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
+    )
         .bind("host-a")
         .bind("192.0.2.10")
         .bind("aa:bb:cc:dd:ee:01")
@@ -46,7 +48,9 @@ async fn host_duplicate_is_rejected() -> anyhow::Result<()> {
         .await?;
 
     let err =
-        sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
+        sqlx::query(
+            "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
+        )
             .bind("host-a") // duplicate hostname
             .bind("192.0.2.11")
             .bind("aa:bb:cc:dd:ee:02")
@@ -76,7 +80,9 @@ async fn host_invalid_subnet_is_rejected() -> anyhow::Result<()> {
 
     let bogus_subnet = Uuid::new_v4();
     let err =
-        sqlx::query("insert into hosts (hostname, ip, mac, subnet_id) values ($1, $2, $3, $4)")
+        sqlx::query(
+            "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
+        )
             .bind("host-bad-subnet")
             .bind("192.0.2.50")
             .bind("aa:bb:cc:dd:ee:03")

@@ -1,8 +1,8 @@
 use axum::{
-    extract::{Form, Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Form, Path, Query, State},
+    http::{header::ACCEPT, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, get_service, post},
+    routing::{get, post},
     Json, Router,
 };
 use ipnet::IpNet;
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::{
     collections::HashSet,
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     path::Path as StdPath,
     str::FromStr,
     sync::Arc,
@@ -97,6 +97,7 @@ pub struct HostUpdateForm {
 #[derive(Deserialize, Default)]
 pub struct HostsQuery {
     pub q: Option<String>,
+    pub dnsmasq: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -217,6 +218,12 @@ struct PxeImageOption {
 }
 
 #[derive(Serialize)]
+struct DnsmasqWarning {
+    code: String,
+    message: String,
+}
+
+#[derive(Serialize)]
 struct SubnetRow {
     id: String,
     name: String,
@@ -301,6 +308,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/find-free-ip", get(api_find_free_ip));
 
     if state.config.pxe_enabled {
+        let pxe_root =
+            std::env::var("PXE_ROOT_DIR").unwrap_or_else(|_| "/var/lib/ipmanager/pxe".to_string());
+        tracing::info!("Serving PXE assets from: {}", pxe_root);
         router = router
             .route("/pxe/images", get(pxe_images_list))
             .route(
@@ -312,10 +322,7 @@ pub fn router(state: AppState) -> Router {
                 get(pxe_images_edit).post(pxe_images_update),
             )
             .route("/pxe/images/{id}/delete", post(pxe_images_delete));
-        router = router.route_service(
-            "/pxe-assets/{*path}",
-            get_service(ServeDir::new(state.config.pxe_root_dir.clone())),
-        );
+        router = router.nest_service("/pxe-assets", ServeDir::new(&pxe_root));
     }
 
     router.with_state(state)
@@ -487,7 +494,7 @@ async fn find_free_ip(state: &AppState, subnet_id: Uuid) -> Result<Ipv4Addr, Str
     };
 
     let taken_hosts: HashSet<Ipv4Addr> =
-        sqlx::query_scalar::<_, String>("select host(ip) from hosts where subnet_id = $1")
+        sqlx::query_scalar::<_, String>("select host(ip_address) from hosts where subnet_id = $1")
             .bind(subnet_id)
             .fetch_all(&state.pool)
             .await
@@ -707,6 +714,65 @@ async fn try_sync_dnsmasq(state: &AppState, context: &str) {
     }
 }
 
+fn wants_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.contains("application/json"))
+        .unwrap_or(false)
+}
+
+fn map_dnsmasq_sync_error(error: &anyhow::Error) -> DnsmasqWarning {
+    for cause in error.chain() {
+        if let Some(io_error) = cause.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    return DnsmasqWarning {
+                        code: "permission_denied".to_string(),
+                        message: "Fehlende Berechtigung fuer dnsmasq Schreibzugriff oder Reload."
+                            .to_string(),
+                    };
+                }
+                std::io::ErrorKind::NotFound => {
+                    return DnsmasqWarning {
+                        code: "not_found".to_string(),
+                        message: "dnsmasq Config-Pfad oder Reload-Kommando wurde nicht gefunden."
+                            .to_string(),
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let message = error.to_string();
+    if message.contains("failed to fetch hosts for dnsmasq sync") {
+        return DnsmasqWarning {
+            code: "db_fetch_failed".to_string(),
+            message: "DNSMASQ Sync scheiterte beim Laden der Hosts aus der DB.".to_string(),
+        };
+    }
+    if message.contains("failed to write dnsmasq hosts file") {
+        return DnsmasqWarning {
+            code: "write_failed".to_string(),
+            message: "DNSMASQ Hosts-Datei konnte nicht geschrieben werden.".to_string(),
+        };
+    }
+    if message.contains("dnsmasq reload command failed")
+        || message.contains("failed to execute dnsmasq reload command")
+    {
+        return DnsmasqWarning {
+            code: "reload_failed".to_string(),
+            message: "DNSMASQ Reload-Kommando ist fehlgeschlagen.".to_string(),
+        };
+    }
+
+    DnsmasqWarning {
+        code: "unknown".to_string(),
+        message: "DNSMASQ Sync fehlgeschlagen. Details im Log.".to_string(),
+    }
+}
+
 async fn dhcp_dnsmasq_page(State(state): State<AppState>, session: Session) -> Response {
     if let Err(resp) = require_auth(&session).await {
         return resp;
@@ -829,13 +895,19 @@ async fn hosts_list(
 
     let q_raw = query.q.clone().unwrap_or_default();
     let q = q_raw.trim().to_string();
+    let dnsmasq_status = query.dnsmasq.as_deref().map(str::to_string);
+    let dnsmasq_message = match query.dnsmasq.as_deref() {
+        Some("ok") => Some("Host erstellt, DHCP-Sync erfolgreich."),
+        Some("warn") => Some("Host erstellt, aber DHCP-Sync fehlgeschlagen. Details im Log."),
+        _ => None,
+    };
 
     let rows: Vec<HostsListRowDb> = if q.is_empty() {
         match sqlx::query_as(
             "select h.id,
                         h.hostname,
-                        host(h.ip),
-                        h.mac,
+                        host(h.ip_address),
+                        h.mac_address,
                         l.name as location_name,
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
@@ -863,8 +935,8 @@ async fn hosts_list(
         match sqlx::query_as(
             "select h.id,
                         h.hostname,
-                        h.ip::text,
-                        h.mac,
+                        h.ip_address::text,
+                        h.mac_address,
                         l.name as location_name,
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
@@ -874,8 +946,8 @@ async fn hosts_list(
                  left join lan_outlets o on o.id = h.lan_outlet_id
                  left join pxe_images pi on pi.id = h.pxe_image_id
                  where h.hostname ilike $1
-                    or (h.ip::text) ilike $1
-                    or h.mac ilike $1
+                    or (h.ip_address::text) ilike $1
+                    or h.mac_address ilike $1
                     or coalesce(l.name, '') ilike $1
                     or coalesce(o.label, '') ilike $1
                     or coalesce(pi.name, '') ilike $1
@@ -925,6 +997,8 @@ async fn hosts_list(
     add_auth_context(&mut ctx, &session, &state).await;
     ctx.insert("hosts", &hosts);
     ctx.insert("q", &q);
+    ctx.insert("dnsmasq_message", &dnsmasq_message);
+    ctx.insert("dnsmasq_status", &dnsmasq_status);
 
     render(&state.templates, "hosts_list.html", ctx)
 }
@@ -1009,6 +1083,7 @@ async fn hosts_new(State(state): State<AppState>, session: Session) -> Response 
 async fn hosts_create(
     State(state): State<AppState>,
     session: Session,
+    headers: HeaderMap,
     Form(form): Form<HostCreateForm>,
 ) -> Response {
     if let Err(resp) = require_auth(&session).await {
@@ -1053,6 +1128,46 @@ async fn hosts_create(
         }
     };
 
+    let managed_subnets: Vec<String> = match sqlx::query_scalar("select cidr::text from subnets")
+        .fetch_all(&state.pool)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = ?e, "DB error in hosts_create loading subnets");
+            return render_error_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DB Fehler beim Laden der Subnets",
+            );
+        }
+    };
+    let ip_addr = std::net::IpAddr::V4(ip);
+    let ip_in_managed_subnet = managed_subnets.iter().any(|cidr| {
+        cidr.parse::<IpNetwork>()
+            .map(|net| net.contains(ip_addr))
+            .unwrap_or(false)
+    });
+    if !ip_in_managed_subnet {
+        if wants_json(&headers) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "IP-Adresse liegt außerhalb der verwalteten Subnetze"
+                })),
+            )
+                .into_response();
+        }
+        let mut resp = render_hosts_new_error(
+            &state,
+            &session,
+            &form,
+            "IP-Adresse liegt außerhalb der verwalteten Subnetze",
+        )
+        .await;
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return resp;
+    }
+
     // IP muss im gewählten Subnet liegen
     let cidr: Option<String> =
         match sqlx::query_scalar("select cidr::text from subnets where id = $1")
@@ -1092,11 +1207,11 @@ async fn hosts_create(
     // Vor dem Insert prüfen, ob Hostname/IP/MAC schon existieren
     if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
         sqlx::query_as::<_, (String, String, String)>(
-            "select hostname, host(ip), mac
+            "select hostname, host(ip_address), mac_address
          from hosts
          where hostname = $1
-            or ip = $2::inet
-            or mac = $3
+            or ip_address = $2::inet
+            or mac_address = $3
          limit 1",
         )
         .bind(&hostname)
@@ -1197,7 +1312,7 @@ async fn hosts_create(
     );
 
     let res = sqlx::query(
-        "insert into hosts (hostname, ip, mac, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id)
+        "insert into hosts (hostname, ip_address, mac_address, location_id, lan_outlet_id, subnet_id, pxe_enabled, pxe_image_id)
          values ($1, $2::inet, $3, $4, $5, $6, $7, $8)",
     )
     .bind(&hostname)
@@ -1217,8 +1332,27 @@ async fn hosts_create(
                 rows_affected = r.rows_affected(),
                 "Inserted host into database"
             );
-            try_sync_dnsmasq(&state, "hosts_create").await;
-            Redirect::to("/hosts").into_response()
+            let warning = match dnsmasq::sync_dnsmasq_hosts(&state.pool, &state.config).await {
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::error!(error = ?e, "dnsmasq sync failed after host create");
+                    Some(map_dnsmasq_sync_error(&e))
+                }
+            };
+            if wants_json(&headers) {
+                let payload = serde_json::json!({
+                    "status": "created",
+                    "dnsmasq_sync": if warning.is_some() { "failed" } else { "ok" },
+                    "warning": warning,
+                });
+                return (StatusCode::CREATED, Json(payload)).into_response();
+            }
+            let redirect_url = if warning.is_some() {
+                "/hosts?dnsmasq=warn"
+            } else {
+                "/hosts?dnsmasq=ok"
+            };
+            Redirect::to(redirect_url).into_response()
         }
         Err(e) => {
             let db_info = e.as_database_error();
@@ -1282,8 +1416,8 @@ async fn host_show(
     let row: Option<HostShowRowDb> = match sqlx::query_as(
         "select h.id,
                 h.hostname,
-                host(h.ip),
-                h.mac,
+                host(h.ip_address),
+                h.mac_address,
                 h.location_id,
                 h.lan_outlet_id,
                 h.subnet_id,
@@ -1491,10 +1625,10 @@ async fn host_update(
     // Vor dem Update prüfen, ob Hostname/IP/MAC schon existieren (anderer Datensatz)
     if let Ok(Some((conflict_host, conflict_ip, conflict_mac))) =
         sqlx::query_as::<_, (String, String, String)>(
-            "select hostname, host(ip), mac
+            "select hostname, host(ip_address), mac_address
              from hosts
              where id <> $1
-               and (hostname = $2 or ip = $3::inet or mac = $4)
+               and (hostname = $2 or ip_address = $3::inet or mac_address = $4)
              limit 1",
         )
         .bind(id)
@@ -1576,8 +1710,8 @@ async fn host_update(
     let res = sqlx::query(
         "update hosts
          set hostname = $1,
-             ip = $2::inet,
-             mac = $3,
+             ip_address = $2::inet,
+             mac_address = $3,
              location_id = $4,
              lan_outlet_id = $5,
              subnet_id = $6,
@@ -1674,8 +1808,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
     let row: Option<HostEditRowDb> = sqlx::query_as(
         "select h.id,
                 h.hostname,
-                host(h.ip),
-                h.mac,
+                host(h.ip_address),
+                h.mac_address,
                 h.location_id,
                 h.lan_outlet_id,
                 h.subnet_id,
@@ -2783,54 +2917,55 @@ fn build_ipxe_script(cfg: &Config, images: &[PxeImage]) -> String {
     out
 }
 
-async fn boot_ipxe(State(state): State<AppState>) -> Response {
+async fn boot_ipxe(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    let client_ip = addr.ip();
     if !state.config.pxe_enabled {
+        tracing::info!(
+            "PXE Boot request from {} - Status: Exit",
+            client_ip
+        );
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let rows: Result<Vec<PxeImagesListRowDb>, _> = sqlx::query_as(
-        "select id,
-                name,
-                kind,
-                arch,
-                kernel_path,
-                initrd_path,
-                chain_url,
-                cmdline,
-                enabled
-         from pxe_images
-         where enabled = true
-         order by name asc",
+    let should_boot = match sqlx::query_scalar::<_, bool>(
+        "select pxe_enabled from hosts where ip_address = $1::inet limit 1",
     )
-    .fetch_all(&state.pool)
-    .await;
-
-    let images = match rows {
-        Ok(v) => v
-            .into_iter()
-            .map(
-                |(id, name, kind, arch, kernel_path, initrd_path, chain_url, cmdline, enabled)| {
-                    PxeImage {
-                        id,
-                        name,
-                        kind,
-                        arch,
-                        kernel_path,
-                        initrd_path,
-                        chain_url,
-                        cmdline,
-                        enabled,
-                    }
-                },
-            )
-            .collect::<Vec<_>>(),
+    .bind(client_ip.to_string())
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(enabled)) => enabled,
+        Ok(None) => false,
         Err(e) => {
-            tracing::error!(error = ?e, "failed to load pxe images");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            tracing::error!(
+                error = ?e,
+                ip = %client_ip,
+                "failed to load host pxe flag"
+            );
+            false
         }
     };
 
-    let script = build_ipxe_script(&state.config, &images);
+    let script = if should_boot {
+        let assets_base = state.config.pxe_http_base_url.as_str().trim_end_matches('/');
+        tracing::info!(
+            "PXE Boot request from {} - Status: Authorized",
+            client_ip
+        );
+        format!(
+            "#!ipxe\nkernel {}/vmlinuz initrd=initrd.img root=/dev/ram0\ninitrd {}/initrd.img\nboot\n",
+            assets_base, assets_base
+        )
+    } else {
+        tracing::info!(
+            "PXE Boot request from {} - Status: Exit",
+            client_ip
+        );
+        "#!ipxe\nexit\n".to_string()
+    };
 
     (
         axum::http::HeaderMap::from_iter(std::iter::once((
@@ -3299,6 +3434,9 @@ mod tests {
             pxe_uefi_bootfile: "ipxe.efi".to_string(),
             dnsmasq_hosts_file: "/etc/dnsmasq.d/01-rust-hosts.conf".to_string(),
             dnsmasq_reload_cmd: "sudo systemctl kill -s SIGHUP dnsmasq".to_string(),
+            dnsmasq_interface: Some("eth0".to_string()),
+            dnsmasq_bind_addr: "127.0.0.1".to_string(),
+            dnsmasq_port: 53,
         }
     }
 

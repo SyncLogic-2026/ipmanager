@@ -17,11 +17,11 @@ tokio = { version = "1", features = ["full"] }
 axum = "0.7"
 
 tower-sessions = { version = "0.13", features = ["signed"] }
-tower-sessions-sqlx-store = { version = "0.15", features = ["postgres"] }
+tower-sessions-sqlx-store = { version = "0.14", features = ["postgres"] }
 time = "0.3"
-tower-http = { version = "0.6", features = ["fs"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
 
-sqlx = { version = "0.8.0", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "chrono", "ipnetwork"] }
+sqlx = { version = "0.8.0", features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "chrono", "ipnetwork", "uuid"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 
