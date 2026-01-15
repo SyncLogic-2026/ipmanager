@@ -35,6 +35,9 @@ pub struct Config {
     // dnsmasq
     pub dnsmasq_hosts_file: String,
     pub dnsmasq_reload_cmd: String,
+    pub dnsmasq_interface: Option<String>,
+    pub dnsmasq_bind_addr: String,
+    pub dnsmasq_port: u16,
 }
 
 impl Config {
@@ -74,6 +77,9 @@ impl Config {
             env_default("DNSMASQ_HOSTS_FILE", "/etc/dnsmasq.d/01-rust-hosts.conf");
         let dnsmasq_reload_cmd =
             env_default("DNSMASQ_RELOAD_CMD", "sudo systemctl kill -s SIGHUP dnsmasq");
+        let dnsmasq_interface = env_optional("DNSMASQ_INTERFACE");
+        let dnsmasq_bind_addr = env_default("DNSMASQ_BIND_ADDR", "127.0.0.1");
+        let dnsmasq_port = env_u16("DNSMASQ_PORT").unwrap_or(53);
 
         Ok(Self {
             database_url,
@@ -101,6 +107,9 @@ impl Config {
             // dnsmasq
             dnsmasq_hosts_file,
             dnsmasq_reload_cmd,
+            dnsmasq_interface,
+            dnsmasq_bind_addr,
+            dnsmasq_port,
         })
     }
 }
@@ -131,4 +140,17 @@ fn env_bool(key: &str) -> Option<bool> {
 
 fn env_duration_secs(key: &str) -> Option<Duration> {
     env_u32(key).map(|v| Duration::from_secs(v as u64))
+}
+
+fn env_optional(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_u16(key: &str) -> Option<u16> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
 }
