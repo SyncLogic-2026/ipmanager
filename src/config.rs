@@ -29,6 +29,7 @@ pub struct Config {
     pub pxe_root_dir: String,
     pub tftp_root_dir: String,
     pub pxe_assets_dir: String,
+    pub pxe_configs_dir: String,
     pub pxe_http_base_url: Url,
     pub pxe_tftp_server: String,
     pub pxe_bios_bootfile: String,
@@ -86,6 +87,9 @@ impl Config {
             .unwrap_or_else(|| "/var/lib/tftpboot".to_string());
         let pxe_assets_dir = env_optional("PXE_ASSETS_DIR").unwrap_or_else(|| {
             format!("{}/pxe-assets", tftp_root_dir.trim_end_matches('/'))
+        });
+        let pxe_configs_dir = env_optional("PXE_CONFIGS_DIR").unwrap_or_else(|| {
+            format!("{}/pxe-configs", tftp_root_dir.trim_end_matches('/'))
         });
         let pxe_http_base_url = Url::parse(&env_default(
             "PXE_HTTP_BASE_URL",
@@ -149,6 +153,7 @@ impl Config {
             pxe_root_dir,
             tftp_root_dir,
             pxe_assets_dir,
+            pxe_configs_dir,
             pxe_http_base_url,
             pxe_tftp_server,
             pxe_bios_bootfile,

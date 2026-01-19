@@ -1,6 +1,7 @@
 use axum::{
     extract::{ConnectInfo, Form, Path, Query, State},
-    http::{header::ACCEPT, HeaderMap, StatusCode},
+    http::{header::ACCEPT, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Json, Router,
@@ -363,6 +364,7 @@ pub fn router(state: AppState) -> Router {
         .route("/dhcp/dnsmasq/deploy", post(dhcp_dnsmasq_deploy))
         // PXE / iPXE
         .route("/boot.ipxe", get(boot_ipxe))
+        .route("/status", get(status_page))
         // API
         .route("/api/login", post(api_login))
         .route("/api/me", get(api_me))
@@ -376,6 +378,8 @@ pub fn router(state: AppState) -> Router {
         let pxe_root =
             std::env::var("PXE_ROOT_DIR").unwrap_or_else(|_| "/var/lib/ipmanager/pxe".to_string());
         tracing::info!("Serving PXE assets from: {}", pxe_root);
+        let pxe_configs_dir = state.config.pxe_configs_dir.clone();
+        tracing::info!("Serving PXE configs from: {}", pxe_configs_dir);
         router = router
             .route("/pxe/images", get(pxe_images_list))
             .route(
@@ -388,9 +392,67 @@ pub fn router(state: AppState) -> Router {
             )
             .route("/pxe/images/:id/delete", post(pxe_images_delete));
         router = router.nest_service("/pxe-assets", ServeDir::new(&pxe_root));
+        let pxe_configs_router = Router::new()
+            .nest_service("/", ServeDir::new(&pxe_configs_dir))
+            .layer(middleware::from_fn(log_ipxe_requests));
+        router = router.nest("/pxe-configs", pxe_configs_router);
     }
 
     router.with_state(state)
+}
+
+async fn log_ipxe_requests(req: Request<axum::body::Body>, next: Next) -> Response {
+    let path = req.uri().path();
+    if path.ends_with(".ipxe") {
+        tracing::info!(path = %path, "ipxe config requested");
+    }
+    next.run(req).await
+}
+
+async fn status_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
+    let pxe_hosts = sqlx::query_scalar::<_, i64>(
+        "select count(*) from hosts where pxe_enabled = true",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let base = std::path::Path::new(&state.config.pxe_assets_dir);
+    let files = [
+        ("wimboot", base.join("wimboot")),
+        ("windows/bootmgr", base.join("windows/bootmgr")),
+        ("windows/bcd", base.join("windows/bcd")),
+        ("windows/boot.wim", base.join("windows/boot.wim")),
+    ];
+
+    let mut rows = String::new();
+    for (label, path) in files {
+        let (status, size) = match tokio::fs::metadata(&path).await {
+            Ok(meta) => ("✅ Vorhanden", meta.len().to_string()),
+            Err(_) => ("❌ Fehlt", "-".to_string()),
+        };
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+            label, status, size
+        ));
+    }
+
+    let body = format!(
+        "<!doctype html>\
+<html lang=\"de\">\
+<head><meta charset=\"utf-8\"><title>Status</title></head>\
+<body>\
+<h1>Status</h1>\
+<p>PXE Hosts in DB: {}</p>\
+<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">\
+<thead><tr><th>Datei</th><th>Status</th><th>Groesse (Bytes)</th></tr></thead>\
+<tbody>{}</tbody>\
+</table>\
+</body></html>",
+        pxe_hosts, rows
+    );
+
+    Ok(Html(body))
 }
 
 /* ----------------------------- Auth helpers ----------------------------- */
@@ -3786,6 +3848,7 @@ mod tests {
             pxe_root_dir: "/var/lib/ipmanager/pxe".to_string(),
             tftp_root_dir: "/var/lib/tftpboot".to_string(),
             pxe_assets_dir: "/var/lib/tftpboot/pxe-assets".to_string(),
+            pxe_configs_dir: "/var/lib/tftpboot/pxe-configs".to_string(),
             pxe_http_base_url: Url::parse("http://localhost:3000/pxe-assets").unwrap(),
             pxe_tftp_server: "192.0.2.1".to_string(),
             pxe_bios_bootfile: "undionly.kpxe".to_string(),

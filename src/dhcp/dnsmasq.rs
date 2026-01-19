@@ -177,7 +177,22 @@ pub async fn sync_dnsmasq_hosts(
         missing_assets_count = ubuntu_hosts;
     }
 
+    let pxe_configs_dir = pxe::ensure_ipxe_configs_dir(config)
+        .await
+        .context("failed to ensure ipxe configs directory")?;
+
     for host in &hosts {
+        let host_label = host
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(host.mac_address.trim());
+        tracing::debug!(
+            host = %host_label,
+            pxe_enabled = host.pxe_enabled,
+            "processing host for dnsmasq"
+        );
         let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
             format!("invalid mac_address in hosts table: {}", host.mac_address)
         })?;
@@ -221,18 +236,15 @@ pub async fn sync_dnsmasq_hosts(
         tokio::fs::write(&file_path, content)
             .await
             .with_context(|| format!("failed to write dnsmasq host file {}", file_path.display()))?;
-    }
 
-    let pxe_hosts: Vec<HostPxe> = hosts
-        .iter()
-        .map(|host| HostPxe {
+        let host_pxe = HostPxe {
             mac_address: host.mac_address.clone(),
             os_type: host.os_type.clone(),
-        })
-        .collect();
-    pxe::write_ipxe_configs(&pxe_hosts, config)
-        .await
-        .context("failed to write ipxe configs")?;
+        };
+        pxe::write_ipxe_config(&host_pxe, &pxe_configs_dir)
+            .await
+            .context("failed to write ipxe config")?;
+    }
 
     let warnings_count = warnings.len();
     update_warnings(status, warnings).await;
