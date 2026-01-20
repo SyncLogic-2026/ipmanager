@@ -15,6 +15,11 @@ struct MacmonEndpointRequest<'a> {
 }
 
 pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
+    if !cfg.macmon_enabled {
+        tracing::info!("macmon disabled; skipping macmon sync");
+        return Ok(0);
+    }
+
     let Some(base_url) = cfg.macmon_base_url.as_deref() else {
         tracing::info!("macmon config missing; skipping macmon sync");
         return Ok(0);
@@ -44,15 +49,9 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
         return Ok(0);
     }
 
-    let skip_ssl = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(|host| host == "10.112.57.2"))
-        .unwrap_or(false);
-    let mut client_builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
-    if skip_ssl {
-        client_builder = client_builder.danger_accept_invalid_certs(true);
-    }
-    let client = client_builder
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(std::time::Duration::from_secs(5))
         .build()
         .context("failed to build macmon http client")?;
 

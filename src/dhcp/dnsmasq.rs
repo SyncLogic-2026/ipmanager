@@ -37,6 +37,8 @@ struct HostRow {
     ip_address: String,
     hostname: Option<String>,
     os_type: Option<String>,
+    subnet_name: String,
+    subnet_network_start: String,
     gateway: Option<String>,
     dns_primary: Option<String>,
     pxe_enabled: bool,
@@ -44,30 +46,16 @@ struct HostRow {
 
 #[derive(Debug, FromRow)]
 struct DhcpRangeRow {
-    dhcp_pool_start: String,
-    dhcp_pool_end: String,
+    name: String,
+    network_start: String,
+    netmask: String,
 }
 
 pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Config) -> Result<()> {
-    match tokio::fs::try_exists(DNSMASQ_GLOBAL_CONFIG_PATH).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(e) => {
-            tracing::error!(
-                error = ?e,
-                path = DNSMASQ_GLOBAL_CONFIG_PATH,
-                "failed to check dnsmasq global config path"
-            );
-            return Err(e).context("failed to check dnsmasq global config path");
-        }
-    }
-
     let ranges: Vec<DhcpRangeRow> = match sqlx::query_as(
-        "select host(dhcp_pool_start) as dhcp_pool_start, host(dhcp_pool_end) as dhcp_pool_end
+        "select name, host(network(cidr::inet)) as network_start, host(netmask(cidr::inet)) as netmask
          from subnets
          where dhcp_enabled = true
-           and dhcp_pool_start is not null
-           and dhcp_pool_end is not null
          order by name",
     )
     .fetch_all(pool)
@@ -91,17 +79,15 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("lo");
+        .unwrap_or("ens33");
     output.push_str(&format!("interface={interface}\n"));
-    output.push_str("bind-interfaces\n");
+    output.push_str("bind-dynamic\n");
+    output.push_str("no-dhcp-interface=lo\n");
+    output.push_str("no-resolv\n");
+    output.push_str("server=8.8.8.8\n");
     output.push_str(&format!("port={}\n", config.dnsmasq_port));
     output.push_str("dhcp-authoritative\n");
-    for range in ranges {
-        output.push_str(&format!(
-            "dhcp-range={},{}\n",
-            range.dhcp_pool_start, range.dhcp_pool_end
-        ));
-    }
+    output.push_str("dhcp-ignore=tag:!known\n");
 
     if let Err(e) = tokio::fs::write(DNSMASQ_GLOBAL_CONFIG_PATH, output).await {
         tracing::error!(
@@ -116,6 +102,10 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
         path = DNSMASQ_GLOBAL_CONFIG_PATH,
         "dnsmasq global config written"
     );
+
+    let conf_dir = Path::new(&config.dnsmasq_conf_dir);
+    ensure_dnsmasq_conf_dir(conf_dir).await?;
+    write_subnet_configs(&ranges, conf_dir).await?;
 
     Ok(())
 }
@@ -135,6 +125,8 @@ pub async fn sync_dnsmasq_hosts(
                 h.ip_address,
                 h.hostname,
                 h.os_type,
+                s.name as subnet_name,
+                host(network(s.cidr::inet)) as subnet_network_start,
                 s.gateway::text as gateway,
                 s.dns_primary::text as dns_primary,
                 h.pxe_enabled
@@ -196,13 +188,14 @@ pub async fn sync_dnsmasq_hosts(
         let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
             format!("invalid mac_address in hosts table: {}", host.mac_address)
         })?;
-        let tag = mac.to_string();
+        let host_tag = mac.to_string();
+        let subnet_tag = subnet_tag(&host.subnet_name, &host.subnet_network_start);
         let mut content = String::new();
-        content.push_str(&format!("dhcp-host={},{}", tag, host.ip_address));
+        content.push_str(&format!("dhcp-host={},{}", host_tag, host.ip_address));
         if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             content.push_str(&format!(",{}", name));
         }
-        content.push_str(&format!(",set:{}\n", tag));
+        content.push_str(&format!(",set:{},set:{}\n", subnet_tag, host_tag));
         if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             if name.chars().any(|c| c.is_whitespace()) {
                 tracing::warn!(
@@ -216,23 +209,24 @@ pub async fn sync_dnsmasq_hosts(
         if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:router,{}\n",
-                tag, gateway
+                subnet_tag, gateway
             ));
         }
         if let Some(dns_primary) = host.dns_primary.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:dns-server,{}\n",
-                tag, dns_primary
+                subnet_tag, dns_primary
             ));
         } else if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:dns-server,{}\n",
-                tag, gateway
+                subnet_tag, gateway
             ));
         }
-        content.push_str(&format!("dhcp-boot=tag:{},{}\n", tag, ipxe_boot));
+        content.push_str(&format!("dhcp-boot=tag:{},{}\n", host_tag, ipxe_boot));
 
-        let file_path = Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", tag));
+        let file_path =
+            Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", host_tag));
         tokio::fs::write(&file_path, content)
             .await
             .with_context(|| format!("failed to write dnsmasq host file {}", file_path.display()))?;
@@ -373,8 +367,12 @@ Bitte pruefe die PXE-Assets unter {}.",
         });
     }
 
-    if let Err(e) = macmon::sync_new_hosts(pool, config).await {
-        tracing::error!(error = ?e, "macmon sync failed");
+    if config.macmon_enabled {
+        if let Err(e) = macmon::sync_new_hosts(pool, config).await {
+            tracing::error!(error = ?e, "macmon sync failed");
+        }
+    } else {
+        tracing::debug!("macmon sync disabled; skipping");
     }
 
     tracing::info!(
@@ -443,6 +441,65 @@ async fn clean_host_configs(conf_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+async fn write_subnet_configs(ranges: &[DhcpRangeRow], conf_dir: &Path) -> Result<()> {
+    clean_subnet_configs(conf_dir).await?;
+    for range in ranges {
+        let tag = subnet_tag(&range.name, &range.network_start);
+        let file_stub = sanitize_dnsmasq_name(&range.name);
+        let file_path = conf_dir.join(format!("subnet_{}.conf", file_stub));
+        let content = format!(
+            "dhcp-range=set:{},{},static,{},12h\n",
+            tag, range.network_start, range.netmask
+        );
+        tokio::fs::write(&file_path, content)
+            .await
+            .with_context(|| format!("failed to write dnsmasq subnet file {}", file_path.display()))?;
+    }
+    Ok(())
+}
+
+async fn clean_subnet_configs(conf_dir: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(conf_dir)
+        .await
+        .with_context(|| format!("failed to read dnsmasq conf dir {}", conf_dir.display()))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|v| v.to_str()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if name.starts_with("subnet_") && name.ends_with(".conf") {
+            tokio::fs::remove_file(&path)
+                .await
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn subnet_tag(name: &str, network_start: &str) -> String {
+    let network = sanitize_dnsmasq_name(network_start);
+    if !network.is_empty() {
+        return network;
+    }
+    sanitize_dnsmasq_name(name)
+}
+
+fn sanitize_dnsmasq_name(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn assets_relative_path(config: &crate::config::Config) -> String {

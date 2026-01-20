@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ===================================================================
-# IPManager - Komplett-Setup (System, iPXE & GitHub Push)
-# Stand: 19. Jan 2026
+# IPManager - Komplett-Setup (System, DNS-Fix, iPXE & GitHub Push)
+# Stand: 20. Jan 2026
 # ===================================================================
 
 set -e
@@ -10,16 +10,19 @@ set -e
 echo "--- Starte IPManager System-Setup für User: $USER ---"
 
 # 1. System-Updates & Abhängigkeiten
+echo "Installiere System-Pakete..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y build-essential libssl-dev pkg-config postgresql postgresql-contrib dnsmasq curl git
+sudo apt install -y build-essential libssl-dev pkg-config postgresql postgresql-contrib dnsmasq curl git tcpdump
 
 # 2. Rust Installation
 if ! command -v cargo &> /dev/null; then
+    echo "Installiere Rust..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     source $HOME/.cargo/env
 fi
 
 # 3. Datenbank Setup
+echo "Konfiguriere PostgreSQL..."
 sudo -u postgres psql -c "CREATE USER ipmanager WITH PASSWORD 'admin123';" || true
 sudo -u postgres psql -c "CREATE DATABASE ipmanager OWNER ipmanager;" || true
 
@@ -54,32 +57,53 @@ done
 # 6. Sudoers-Regel für dnsmasq Reload
 SUDOERS_LINE="$USER ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart dnsmasq"
 if ! sudo grep -q "$USER.*dnsmasq" /etc/sudoers; then
+    echo "Erstelle Sudoers-Eintrag für dnsmasq..."
     echo "$SUDOERS_LINE" | sudo tee -a /etc/sudoers > /dev/null
 fi
 
 # 7. SQLx CLI
 if ! command -v sqlx &> /dev/null; then
+    echo "Installiere SQLx CLI..."
     cargo install sqlx-cli --no-default-features --features postgres
 fi
 
-# 8. GitHub Remote & Push Setup
-echo "Konfiguriere Git und führe Push aus..."
+# 8. DNS-Konflikt lösen (systemd-resolved deaktivieren)
+# Dies macht Port 53 frei für dnsmasq
+echo "Löse Port 53 Konflikt (systemd-resolved)..."
+if systemctl is-active --quiet systemd-resolved; then
+    sudo systemctl disable --now systemd-resolved
+    
+    # Backup und Neuerstellung der resolv.conf
+    [ -L /etc/resolv.conf ] && sudo rm /etc/resolv.conf
+    # Nutze Google & Cloudflare als Fallback, damit der Server Internet behält
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" | sudo tee /etc/resolv.conf > /dev/null
+    echo "systemd-resolved deaktiviert. Port 53 ist nun frei für dnsmasq."
+else
+    echo "systemd-resolved ist bereits inaktiv oder nicht vorhanden."
+fi
 
-# GitHub Hostkey zu known_hosts hinzufügen (behebt 'Host key verification failed')
+# 9. GitHub Remote & Push Setup
+echo "Konfiguriere Git und führe Push aus..."
 mkdir -p ~/.ssh
 ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 
-# Remote auf SSH umstellen
 git remote set-url origin git@github.com:SyncLogic-2026/ipmanager.git || git remote add origin git@github.com:SyncLogic-2026/ipmanager.git
 
-# Änderungen committen und pushen
 git add .
-# Prüfen, ob es Änderungen gibt, bevor wir committen
 if ! git diff-index --quiet HEAD --; then
-    git commit -m "Update: System Setup, iPXE images and configurations"
+    git commit -m "Update: System Setup mit DNS-Fix und iPXE Assets"
     git push -u origin main || git push -u origin master
 else
     echo "Keine Änderungen zum Committen vorhanden."
 fi
 
+# 10. Abschluss-Check
+echo "Prüfe Port-Belegung..."
+if sudo ss -tulpn | grep -q ":53 "; then
+    echo "WARNUNG: Port 53 ist noch belegt! Prüfe mit 'sudo ss -tulpn | grep :53'"
+else
+    echo "ERFOLG: Port 53 ist frei und bereit für den IPManager."
+fi
+
 echo "--- Setup und Push erfolgreich abgeschlossen! ---"
+echo "Du kannst den IPManager nun mit 'cargo run' starten."

@@ -46,6 +46,7 @@ pub struct Config {
     pub admin_email: Option<String>,
 
     // Macmon
+    pub macmon_enabled: bool,
     pub macmon_base_url: Option<String>,
     pub macmon_username: Option<String>,
     pub macmon_password: Option<String>,
@@ -117,6 +118,7 @@ impl Config {
         let smtp_use_starttls = env_bool("SMTP_USE_STARTTLS").unwrap_or(true);
         let admin_email = env_optional("ADMIN_EMAIL");
 
+        let macmon_enabled = env_bool("MACMON_ENABLED").unwrap_or(false);
         let macmon_base_url = env_optional("MACMON_BASE_URL");
         let macmon_username = env_optional("MACMON_USERNAME");
         let macmon_password = env_optional("MACMON_PASSWORD");
@@ -168,6 +170,7 @@ impl Config {
             smtp_use_starttls,
             admin_email,
 
+            macmon_enabled,
             macmon_base_url,
             macmon_username,
             macmon_password,

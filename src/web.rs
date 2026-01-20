@@ -3861,6 +3861,7 @@ mod tests {
             smtp_to: Vec::new(),
             smtp_use_starttls: true,
             admin_email: None,
+            macmon_enabled: false,
             macmon_base_url: None,
             macmon_username: None,
             macmon_password: None,
