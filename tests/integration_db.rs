@@ -40,24 +40,23 @@ async fn host_duplicate_is_rejected() -> anyhow::Result<()> {
     sqlx::query(
         "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
     )
-        .bind("host-a")
-        .bind("192.0.2.10")
-        .bind("aa:bb:cc:dd:ee:01")
-        .bind(subnet_id)
-        .execute(&mut *tx)
-        .await?;
+    .bind("host-a")
+    .bind("192.0.2.10")
+    .bind("aa:bb:cc:dd:ee:01")
+    .bind(subnet_id)
+    .execute(&mut *tx)
+    .await?;
 
-    let err =
-        sqlx::query(
-            "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
-        )
-            .bind("host-a") // duplicate hostname
-            .bind("192.0.2.11")
-            .bind("aa:bb:cc:dd:ee:02")
-            .bind(subnet_id)
-            .execute(&mut *tx)
-            .await
-            .expect_err("duplicate hostname should fail");
+    let err = sqlx::query(
+        "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
+    )
+    .bind("host-a") // duplicate hostname
+    .bind("192.0.2.11")
+    .bind("aa:bb:cc:dd:ee:02")
+    .bind(subnet_id)
+    .execute(&mut *tx)
+    .await
+    .expect_err("duplicate hostname should fail");
 
     let code = err
         .as_database_error()
@@ -79,17 +78,16 @@ async fn host_invalid_subnet_is_rejected() -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
 
     let bogus_subnet = Uuid::new_v4();
-    let err =
-        sqlx::query(
-            "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
-        )
-            .bind("host-bad-subnet")
-            .bind("192.0.2.50")
-            .bind("aa:bb:cc:dd:ee:03")
-            .bind(bogus_subnet)
-            .execute(&mut *tx)
-            .await
-            .expect_err("FK violation expected for missing subnet");
+    let err = sqlx::query(
+        "insert into hosts (hostname, ip_address, mac_address, subnet_id) values ($1, $2, $3, $4)",
+    )
+    .bind("host-bad-subnet")
+    .bind("192.0.2.50")
+    .bind("aa:bb:cc:dd:ee:03")
+    .bind(bogus_subnet)
+    .execute(&mut *tx)
+    .await
+    .expect_err("FK violation expected for missing subnet");
 
     let code = err
         .as_database_error()

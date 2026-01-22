@@ -34,7 +34,9 @@ pub async fn send_admin_alert(cfg: &Config, subject: &str, body: &str) -> Result
         let mailbox = to.parse::<Mailbox>().context("SMTP_TO is invalid")?;
         builder = builder.to(mailbox);
     }
-    let message = builder.body(body.to_string()).context("failed to build email")?;
+    let message = builder
+        .body(body.to_string())
+        .context("failed to build email")?;
 
     let mut builder = if cfg.smtp_use_starttls {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)

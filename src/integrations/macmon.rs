@@ -113,12 +113,9 @@ pub async fn sync_new_hosts(pool: &PgPool, cfg: &Config) -> Result<usize> {
                         body = body
                     );
                     tokio::spawn(async move {
-                        if let Err(e) = email::send_admin_alert(
-                            &cfg,
-                            "ipmanager: macmon API Fehler",
-                            &message,
-                        )
-                        .await
+                        if let Err(e) =
+                            email::send_admin_alert(&cfg, "ipmanager: macmon API Fehler", &message)
+                                .await
                         {
                             tracing::error!(error = ?e, "failed to send macmon email alert");
                         }

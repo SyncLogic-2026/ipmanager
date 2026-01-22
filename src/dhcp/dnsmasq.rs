@@ -41,6 +41,7 @@ struct HostRow {
     subnet_network_start: String,
     gateway: Option<String>,
     dns_primary: Option<String>,
+    boot_target: String,
     pxe_enabled: bool,
 }
 
@@ -90,14 +91,35 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str(&format!("interface={interface}\n"));
     output.push_str("bind-dynamic\n");
     output.push_str("no-dhcp-interface=lo\n");
+    let domain_name = ranges
+        .iter()
+        .map(|range| range.dns_zone.as_deref().map(str::trim))
+        .flatten()
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| config.domain_name.trim());
     output.push_str("expand-hosts\n");
-    output.push_str(&format!("domain={}\n", config.domain_name));
-    output.push_str(&format!("local=/{}/\n", config.domain_name));
+    output.push_str(&format!("domain={}\n", domain_name));
+    output.push_str(&format!("local=/{}/\n", domain_name));
     output.push_str("domain-needed\n");
     output.push_str("bogus-priv\n");
     output.push_str("no-resolv\n");
     output.push_str("server=8.8.8.8\n");
     output.push_str("port=53\n");
+    output.push_str(&format!("dhcp-option=option:domain-name,{}\n", domain_name));
+    output.push_str("enable-tftp\n");
+    output.push_str("tftp-root=/var/lib/tftpboot\n");
+    output.push_str("dhcp-match=set:efi64,option:client-arch,7\n");
+    output.push_str("dhcp-match=set:efi64,option:client-arch,9\n");
+    output.push_str("dhcp-boot=tag:!efi64,boot/x64/wdsnbp.com\n");
+    output.push_str("dhcp-boot=tag:boot_zenworks,boot/x64/bcd.zenworks\n");
+    output.push_str("dhcp-boot=tag:boot_local,boot/x64/bcd.default\n");
+    if config.enable_ipxe {
+        output.push_str("dhcp-userclass=set:ipxe,iPXE\n");
+        output.push_str(&format!(
+            "dhcp-boot=tag:ipxe,http://{}:3000/api/v1/pxe/menu\n",
+            config.ipmanager_ip
+        ));
+    }
     output.push_str("dhcp-authoritative\n");
     output.push_str("dhcp-ignore=tag:!known\n");
 
@@ -141,6 +163,7 @@ pub async fn sync_dnsmasq_hosts(
                 host(network(s.cidr::inet)) as subnet_network_start,
                 s.gateway::text as gateway,
                 s.dns_primary::text as dns_primary,
+                h.boot_target,
                 h.pxe_enabled
          from hosts h
          join subnets s on s.id = h.subnet_id
@@ -163,6 +186,7 @@ pub async fn sync_dnsmasq_hosts(
 
     let mut warnings = Vec::new();
     let mut missing_assets_count = 0usize;
+    check_windows_boot_files().await;
     let ubuntu_assets_ok = check_ubuntu_assets(&config.pxe_assets_dir).await;
     let ubuntu_hosts = hosts
         .iter()
@@ -181,9 +205,13 @@ pub async fn sync_dnsmasq_hosts(
         missing_assets_count = ubuntu_hosts;
     }
 
-    let pxe_configs_dir = pxe::ensure_ipxe_configs_dir(config)
-        .await
-        .context("failed to ensure ipxe configs directory")?;
+    let pxe_configs_dir = match pxe::ensure_ipxe_configs_dir(config).await {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::warn!(error = ?e, "pxe configs directory not writable; skipping iPXE configs");
+            None
+        }
+    };
 
     for host in &hosts {
         let host_label = host
@@ -197,18 +225,36 @@ pub async fn sync_dnsmasq_hosts(
             pxe_enabled = host.pxe_enabled,
             "processing host for dnsmasq"
         );
-        let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
-            format!("invalid mac_address in hosts table: {}", host.mac_address)
-        })?;
+        let mac = MacAddr::from_str(host.mac_address.trim())
+            .with_context(|| format!("invalid mac_address in hosts table: {}", host.mac_address))?;
         let host_tag = mac.to_string();
         let subnet_tag = subnet_tag(&host.subnet_name, &host.subnet_network_start);
         let mut content = String::new();
         content.push_str(&format!("dhcp-host={},{}", host_tag, host.ip_address));
-        if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(name) = host
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             content.push_str(&format!(",{}", name));
         }
-        content.push_str(&format!(",set:{},set:{}\n", subnet_tag, host_tag));
-        if let Some(name) = host.hostname.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        let boot_target = host.boot_target.trim();
+        let boot_tag = if boot_target.eq_ignore_ascii_case("zenworks") {
+            "boot_zenworks"
+        } else {
+            "boot_local"
+        };
+        content.push_str(&format!(
+            ",set:{},set:{},set:{}\n",
+            subnet_tag, host_tag, boot_tag
+        ));
+        if let Some(name) = host
+            .hostname
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             if name.chars().any(|c| c.is_whitespace()) {
                 tracing::warn!(
                     hostname = %name,
@@ -218,18 +264,33 @@ pub async fn sync_dnsmasq_hosts(
                 content.push_str(&format!("address=/{}/{}\n", name, host.ip_address));
             }
         }
-        if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(gateway) = host
+            .gateway
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:router,{}\n",
                 subnet_tag, gateway
             ));
         }
-        if let Some(dns_primary) = host.dns_primary.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        if let Some(dns_primary) = host
+            .dns_primary
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:dns-server,{}\n",
                 subnet_tag, dns_primary
             ));
-        } else if let Some(gateway) = host.gateway.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+        } else if let Some(gateway) = host
+            .gateway
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
             content.push_str(&format!(
                 "dhcp-option=tag:{},option:dns-server,{}\n",
                 subnet_tag, gateway
@@ -237,19 +298,22 @@ pub async fn sync_dnsmasq_hosts(
         }
         content.push_str(&format!("dhcp-boot=tag:{},{}\n", host_tag, ipxe_boot));
 
-        let file_path =
-            Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", host_tag));
+        let file_path = Path::new(&config.dnsmasq_conf_dir).join(format!("host_{}.conf", host_tag));
         tokio::fs::write(&file_path, content)
             .await
-            .with_context(|| format!("failed to write dnsmasq host file {}", file_path.display()))?;
+            .with_context(|| {
+                format!("failed to write dnsmasq host file {}", file_path.display())
+            })?;
 
         let host_pxe = HostPxe {
             mac_address: host.mac_address.clone(),
             os_type: host.os_type.clone(),
         };
-        pxe::write_ipxe_config(&host_pxe, &pxe_configs_dir)
-            .await
-            .context("failed to write ipxe config")?;
+        if let Some(configs_dir) = pxe_configs_dir.as_deref() {
+            if let Err(e) = pxe::write_ipxe_config(&host_pxe, configs_dir).await {
+                tracing::warn!(error = ?e, "failed to write ipxe config");
+            }
+        }
     }
 
     let warnings_count = warnings.len();
@@ -274,6 +338,7 @@ pub async fn sync_dnsmasq_hosts(
                     stderr = %stderr,
                     "dnsmasq --test failed"
                 );
+                tracing::error!("dnsmasq --test failed; aborting reload");
                 update_last_test(status, false, Some(stderr.to_string())).await;
                 let cfg = config.clone();
                 let body = format!("dnsmasq --test ist fehlgeschlagen:\n{stderr}");
@@ -327,12 +392,9 @@ pub async fn sync_dnsmasq_hosts(
             reload_status, "sudo systemctl restart dnsmasq"
         );
         tokio::spawn(async move {
-            if let Err(e) = email::send_admin_alert(
-                &cfg,
-                "ipmanager: dnsmasq restart fehlgeschlagen",
-                &body,
-            )
-            .await
+            if let Err(e) =
+                email::send_admin_alert(&cfg, "ipmanager: dnsmasq restart fehlgeschlagen", &body)
+                    .await
             {
                 tracing::error!(error = ?e, "failed to send dnsmasq restart email alert");
             }
@@ -352,14 +414,13 @@ pub async fn sync_dnsmasq_hosts(
         "warnings_count": warnings_count,
         "has_orphans": missing_assets_count > 0,
     });
-    if let Err(e) = sqlx::query(
-        "insert into audit_logs (user_id, action, details) values ($1, $2, $3)",
-    )
-    .bind(user_id)
-    .bind("dnsmasq_sync")
-    .bind(details)
-    .execute(pool)
-    .await
+    if let Err(e) =
+        sqlx::query("insert into audit_logs (user_id, action, details) values ($1, $2, $3)")
+            .bind(user_id)
+            .bind("dnsmasq_sync")
+            .bind(details)
+            .execute(pool)
+            .await
     {
         tracing::error!(error = ?e, "failed to write audit log for dnsmasq sync");
     }
@@ -506,7 +567,12 @@ async fn write_subnet_configs(
         content.push_str(&format!("dhcp-option=tag:{},42,{}\n", tag, ntp_server));
         tokio::fs::write(&file_path, content)
             .await
-            .with_context(|| format!("failed to write dnsmasq subnet file {}", file_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to write dnsmasq subnet file {}",
+                    file_path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -585,16 +651,54 @@ async fn check_ubuntu_assets(pxe_assets_dir: &str) -> bool {
     kernel_ok && initrd_ok
 }
 
+async fn check_windows_boot_files() {
+    let base = Path::new("/var/lib/tftpboot/boot/x64");
+    let expected = ["bootmgfw.efi", "bcd", "boot.wim"];
+    let mut entries: Vec<String> = Vec::new();
+
+    match tokio::fs::read_dir(base).await {
+        Ok(mut dir) => {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                if let Some(name) = entry.file_name().to_str() {
+                    entries.push(name.to_string());
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, path = %base.display(), "failed to read Windows boot dir");
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Windows PXE boot files:".to_string());
+    for name in expected {
+        let path = base.join(name);
+        let exists = tokio::fs::try_exists(&path).await.unwrap_or(false);
+        if !exists {
+            if let Some(actual) = entries
+                .iter()
+                .find(|entry| entry.eq_ignore_ascii_case(name) && entry.as_str() != name)
+            {
+                tracing::warn!(
+                    expected = %name,
+                    actual = %actual,
+                    "Windows boot file has wrong casing"
+                );
+            }
+        }
+        let status = if exists { "[OK]" } else { "[MISSING]" };
+        lines.push(format!("{status} {name}"));
+    }
+    lines.push("HINWEIS: Um HTTP-Boot zu nutzen, stelle sicher, dass die BCD via bcdedit konfiguriert ist: bcdedit /store BCD /set {ramdiskoptions} ramdisktftpblocksize 16384 bcdedit /store BCD /set {bootmgr} nobootux yes (optional fuer schnelleren Start)".to_string());
+    tracing::info!("\n{}", lines.join("\n"));
+}
+
 pub async fn record_sync_error(status: &Mutex<DnsmasqStatus>, message: String) {
     let mut guard = status.lock().await;
     guard.warnings = vec![message];
 }
 
-async fn update_last_test(
-    status: &Mutex<DnsmasqStatus>,
-    ok: bool,
-    stderr: Option<String>,
-) {
+async fn update_last_test(status: &Mutex<DnsmasqStatus>, ok: bool, stderr: Option<String>) {
     let mut guard = status.lock().await;
     guard.last_test = Some(DnsmasqTestResult {
         ok,

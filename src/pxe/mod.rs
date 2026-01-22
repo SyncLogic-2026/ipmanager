@@ -19,13 +19,9 @@ pub async fn ensure_ipxe_configs_dir(config: &Config) -> Result<std::path::PathB
     Ok(configs_dir)
 }
 
-pub async fn write_ipxe_config(
-    host: &HostPxe,
-    configs_dir: &std::path::Path,
-) -> Result<()> {
-    let mac = MacAddr::from_str(host.mac_address.trim()).with_context(|| {
-        format!("invalid mac_address in hosts table: {}", host.mac_address)
-    })?;
+pub async fn write_ipxe_config(host: &HostPxe, configs_dir: &std::path::Path) -> Result<()> {
+    let mac = MacAddr::from_str(host.mac_address.trim())
+        .with_context(|| format!("invalid mac_address in hosts table: {}", host.mac_address))?;
     let mac_dash = mac.to_string().replace(':', "-");
     let script = render_ipxe_script(host.os_type.as_deref());
     let file_path = configs_dir.join(format!("host-{}.ipxe", mac_dash));

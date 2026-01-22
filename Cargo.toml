@@ -15,6 +15,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 
 axum = "0.7"
+bytes = "1"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 
 tower-sessions = { version = "0.13", features = ["signed"] }
 tower-sessions-sqlx-store = { version = "0.14", features = ["postgres"] }

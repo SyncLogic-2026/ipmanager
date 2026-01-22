@@ -35,6 +35,14 @@ sudo mkdir -p /etc/dnsmasq.d/
 sudo chown -R $USER:$USER /etc/dnsmasq.d/
 sudo chown -R $USER:$USER /var/lib/tftpboot/
 
+# 4b. .env Defaults
+if [ ! -f .env ]; then
+    touch .env
+fi
+if ! grep -q "^ENABLE_IPXE=" .env 2>/dev/null; then
+    echo "ENABLE_IPXE=false" >> .env
+fi
+
 # 5. iPXE Images Download
 echo "Lade iPXE Binaries herunter..."
 IPXE_DIR="/var/lib/tftpboot/pxe-assets"

@@ -60,6 +60,7 @@ pub struct Config {
     pub dnsmasq_port: u16,
     pub domain_name: String,
     pub ipmanager_ip: String,
+    pub enable_ipxe: bool,
 }
 
 impl Config {
@@ -88,12 +89,10 @@ impl Config {
         let tftp_root_dir = env_optional("TFTP_ROOT")
             .or_else(|| env_optional("TFTP_ROOT_DIR"))
             .unwrap_or_else(|| "/var/lib/tftpboot".to_string());
-        let pxe_assets_dir = env_optional("PXE_ASSETS_DIR").unwrap_or_else(|| {
-            format!("{}/pxe-assets", tftp_root_dir.trim_end_matches('/'))
-        });
-        let pxe_configs_dir = env_optional("PXE_CONFIGS_DIR").unwrap_or_else(|| {
-            format!("{}/pxe-configs", tftp_root_dir.trim_end_matches('/'))
-        });
+        let pxe_assets_dir = env_optional("PXE_ASSETS_DIR")
+            .unwrap_or_else(|| format!("{}/pxe-assets", tftp_root_dir.trim_end_matches('/')));
+        let pxe_configs_dir = env_optional("PXE_CONFIGS_DIR")
+            .unwrap_or_else(|| format!("{}/pxe-configs", tftp_root_dir.trim_end_matches('/')));
         let pxe_http_base_url = Url::parse(&env_default(
             "PXE_HTTP_BASE_URL",
             "http://127.0.0.1:3000/pxe-assets",
@@ -138,6 +137,7 @@ impl Config {
         let dnsmasq_port = env_u16("DNSMASQ_PORT").unwrap_or(53);
         let domain_name = env_default("DOMAIN_NAME", "ipmanager.local");
         let ipmanager_ip = env_default("IPMANAGER_IP", "127.0.0.1");
+        let enable_ipxe = env_bool("ENABLE_IPXE").unwrap_or(false);
 
         Ok(Self {
             database_url,
@@ -188,6 +188,7 @@ impl Config {
             dnsmasq_port,
             domain_name,
             ipmanager_ip,
+            enable_ipxe,
         })
     }
 }

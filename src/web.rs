@@ -3,9 +3,11 @@ use axum::{
     http::{header::ACCEPT, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, post},
+    routing::{get, patch, post, put},
     Json, Router,
 };
+use bytes::Bytes;
+use futures_util::stream::Stream;
 use ipnet::IpNet;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
@@ -13,19 +15,23 @@ use sqlx::PgPool;
 use std::{
     collections::HashSet,
     net::{Ipv4Addr, SocketAddr},
+    os::unix::fs::symlink,
     path::{Path as StdPath, PathBuf},
+    pin::Pin,
     str::FromStr,
     sync::Arc,
+    task::{Context as TaskContext, Poll},
 };
 use tera::{Context, Tera};
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use tokio_util::io::ReaderStream;
 use tower_sessions::Session;
 use uuid::Uuid;
 
+use crate::config::Config;
 use crate::dhcp::dnsmasq;
 use crate::domain::mac::MacAddr;
-use crate::config::Config;
 use tower_http::services::ServeDir;
 
 #[derive(Clone)]
@@ -74,6 +80,27 @@ pub struct HostsApiQuery {
     pub per_page: Option<u32>,
 }
 
+#[derive(Deserialize)]
+struct SetBootRequest {
+    mac: String,
+    target: String,
+}
+
+#[derive(Deserialize)]
+struct BootTargetRequest {
+    target: String,
+}
+
+#[derive(Deserialize)]
+struct PxeMenuQuery {
+    mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UnattendQuery {
+    mac: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct HostApiItem {
     pub id: String,
@@ -83,6 +110,7 @@ pub struct HostApiItem {
     pub pxe_enabled: bool,
     pub pxe_image_name: Option<String>,
     pub os_type: Option<String>,
+    pub boot_target: String,
 }
 
 #[derive(Serialize)]
@@ -375,6 +403,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/find-free-ip", get(api_find_free_ip))
         .route("/api/hosts", get(api_hosts))
         .route("/api/dnsmasq/status", get(api_dnsmasq_status))
+        .route("/api/v1/pxe/menu", get(pxe_menu))
+        .route("/api/v1/pxe/config/unattend.xml", get(pxe_unattend))
+        .route("/api/v1/pxe/set-boot", post(api_set_pxe_boot))
+        .route("/api/v1/hosts/:mac/boot", put(api_set_host_boot))
+        .route("/api/v1/hosts/:mac/boot", patch(api_set_host_boot))
         .route("/api/admin/shutdown", post(api_admin_shutdown));
 
     if state.config.pxe_enabled {
@@ -383,6 +416,9 @@ pub fn router(state: AppState) -> Router {
         tracing::info!("Serving PXE assets from: {}", pxe_root);
         let pxe_configs_dir = state.config.pxe_configs_dir.clone();
         tracing::info!("Serving PXE configs from: {}", pxe_configs_dir);
+        if let Err(e) = ensure_lowercase_symlinks("/var/lib/tftpboot/boot/x64") {
+            tracing::warn!(error = ?e, "failed to ensure Windows boot symlinks");
+        }
         router = router
             .route("/pxe/images", get(pxe_images_list))
             .route(
@@ -395,6 +431,8 @@ pub fn router(state: AppState) -> Router {
             )
             .route("/pxe/images/:id/delete", post(pxe_images_delete));
         router = router.nest_service("/pxe-assets", ServeDir::new(&pxe_root));
+        let boot_router = Router::new().route("/*file", get(pxe_boot_file));
+        router = router.nest("/api/v1/pxe/boot/x64", boot_router);
         let pxe_configs_router = Router::new()
             .nest_service("/", ServeDir::new(&pxe_configs_dir))
             .layer(middleware::from_fn(log_ipxe_requests));
@@ -412,13 +450,140 @@ async fn log_ipxe_requests(req: Request<axum::body::Body>, next: Next) -> Respon
     next.run(req).await
 }
 
+fn ensure_lowercase_symlinks(base: &str) -> std::io::Result<()> {
+    let base_path = StdPath::new(base);
+    let entries = std::fs::read_dir(base_path)?;
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = match file_name.to_str() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        let lower_name = file_name.to_ascii_lowercase();
+        if lower_name == file_name {
+            continue;
+        }
+        let lower_path = base_path.join(&lower_name);
+        if lower_path.exists() {
+            continue;
+        }
+        symlink(&file_name, &lower_path)?;
+    }
+
+    Ok(())
+}
+
+struct BootStream<S> {
+    inner: S,
+    on_complete: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+impl<S> BootStream<S> {
+    fn new(inner: S, on_complete: Option<Box<dyn FnOnce() + Send + 'static>>) -> Self {
+        Self { inner, on_complete }
+    }
+}
+
+impl<S> Stream for BootStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let item = Pin::new(&mut self.inner).poll_next(cx);
+        if let Poll::Ready(None) = item {
+            if let Some(on_complete) = self.on_complete.take() {
+                on_complete();
+            }
+        }
+        item
+    }
+}
+
+async fn pxe_boot_file(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(file): Path<String>,
+) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let file = file.trim_start_matches('/');
+    if file.is_empty() || file.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let base = StdPath::new("/var/lib/tftpboot/boot/x64");
+    let full_path = base.join(file);
+    let metadata = match tokio::fs::metadata(&full_path).await {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let path_lower = file.to_ascii_lowercase();
+    let tag = if path_lower.ends_with(".wim") {
+        "[WIM-STREAM] "
+    } else {
+        ""
+    };
+    tracing::info!(
+        client_ip = %addr.ip(),
+        path = %full_path.display(),
+        size_bytes = %metadata.len(),
+        "{tag}boot file download"
+    );
+
+    let on_complete: Option<Box<dyn FnOnce() + Send + 'static>> =
+        if path_lower.ends_with("bcd.zenworks") {
+        let pool = state.pool.clone();
+        let client_ip = addr.ip().to_string();
+        Some(Box::new(move || {
+            tokio::spawn(async move {
+                if let Err(e) = sqlx::query(
+                    "update hosts set boot_target = 'local' where ip_address = $1 and boot_target = 'zenworks'",
+                )
+                .bind(&client_ip)
+                .execute(&pool)
+                .await
+                {
+                    tracing::warn!(error = ?e, client_ip = %client_ip, "failed to reset boot_target");
+                } else {
+                    tracing::info!(client_ip = %client_ip, "boot_target reset to local after Zenworks BCD");
+                }
+            });
+        }) as Box<dyn FnOnce() + Send + 'static>)
+    } else {
+        None
+    };
+
+    let file = match tokio::fs::File::open(&full_path).await {
+        Ok(file) => file,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let stream = BootStream::new(ReaderStream::new(file), on_complete);
+    let mut response = axum::body::Body::from_stream(stream).into_response();
+    if path_lower.ends_with(".wim") || path_lower.ends_with(".efi") {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/octet-stream"),
+        );
+    }
+    response
+}
+
 async fn status_page(State(state): State<AppState>) -> Result<Html<String>, StatusCode> {
-    let pxe_hosts = sqlx::query_scalar::<_, i64>(
-        "select count(*) from hosts where pxe_enabled = true",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pxe_hosts =
+        sqlx::query_scalar::<_, i64>("select count(*) from hosts where pxe_enabled = true")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let base = std::path::Path::new(&state.config.pxe_assets_dir);
     let files = [
@@ -589,7 +754,10 @@ async fn load_orphaned_hosts(pool: &PgPool, tftp_set: &HashSet<String>) -> Vec<O
 
     rows.into_iter()
         .filter_map(|(hostname, mac_address, pxe_image)| {
-            let image = pxe_image.as_deref().map(str::trim).filter(|v| !v.is_empty())?;
+            let image = pxe_image
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())?;
             if !valid_rel_path(image) {
                 return None;
             }
@@ -606,15 +774,19 @@ async fn load_orphaned_hosts(pool: &PgPool, tftp_set: &HashSet<String>) -> Vec<O
 }
 
 async fn load_audit_logs(pool: &PgPool) -> Vec<AuditLogEntry> {
-    let rows: Vec<(chrono::DateTime<chrono::Utc>, Option<Uuid>, String, serde_json::Value)> =
-        match sqlx::query_as(
-            "select timestamp, user_id, action, details
+    let rows: Vec<(
+        chrono::DateTime<chrono::Utc>,
+        Option<Uuid>,
+        String,
+        serde_json::Value,
+    )> = match sqlx::query_as(
+        "select timestamp, user_id, action, details
              from audit_logs
              order by timestamp desc
              limit 5",
-        )
-        .fetch_all(pool)
-        .await
+    )
+    .fetch_all(pool)
+    .await
     {
         Ok(v) => v,
         Err(e) => {
@@ -959,14 +1131,13 @@ async fn me_page(State(state): State<AppState>, session: Session) -> Response {
 /* ----------------------------- dnsmasq DHCP (SSR) ----------------------------- */
 
 async fn try_sync_dnsmasq(state: &AppState, context: &str) {
-    if let Err(e) =
-        dnsmasq::sync_dnsmasq_hosts(
-            &state.pool,
-            &state.config,
-            state.dnsmasq_status.as_ref(),
-            None,
-        )
-            .await
+    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(
+        &state.pool,
+        &state.config,
+        state.dnsmasq_status.as_ref(),
+        None,
+    )
+    .await
     {
         tracing::error!(error = ?e, %context, "dnsmasq sync failed");
     } else {
@@ -1067,9 +1238,7 @@ async fn dhcp_dnsmasq_page(State(state): State<AppState>, session: Session) -> R
             add_auth_context(&mut ctx, &session, &state).await;
             ctx.insert(
                 "error",
-                &Some(format!(
-                    "Hosts-Datei konnte nicht gelesen werden: {e:#}"
-                )),
+                &Some(format!("Hosts-Datei konnte nicht gelesen werden: {e:#}")),
             );
             ctx.insert("hosts_preview", &"".to_string());
             ctx.insert("dnsmasq_hosts_file", &cfg.dnsmasq_hosts_file);
@@ -1102,13 +1271,8 @@ async fn dhcp_dnsmasq_deploy(State(state): State<AppState>, session: Session) ->
     };
 
     let user_id = load_user_id_from_session(&session, &state.pool).await;
-    if let Err(e) = dnsmasq::sync_dnsmasq_hosts(
-        &state.pool,
-        &cfg,
-        state.dnsmasq_status.as_ref(),
-        user_id,
-    )
-    .await
+    if let Err(e) =
+        dnsmasq::sync_dnsmasq_hosts(&state.pool, &cfg, state.dnsmasq_status.as_ref(), user_id).await
     {
         tracing::error!(error = ?e, "dnsmasq deploy failed");
 
@@ -1155,6 +1319,7 @@ type HostsListRowDb = (
     bool,
     Option<String>,
     Option<String>,
+    String,
 );
 
 async fn hosts_list(
@@ -1187,7 +1352,8 @@ async fn hosts_list(
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
                         pi.name as pxe_image_name,
-                        h.os_type
+                        h.os_type,
+                        h.boot_target
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
@@ -1217,7 +1383,8 @@ async fn hosts_list(
                         o.label as lan_outlet_label,
                         h.pxe_enabled,
                         pi.name as pxe_image_name,
-                        h.os_type
+                        h.os_type,
+                        h.boot_target
                  from hosts h
                  left join locations l on l.id = h.location_id
                  left join lan_outlets o on o.id = h.lan_outlet_id
@@ -1258,6 +1425,7 @@ async fn hosts_list(
                 pxe_enabled,
                 pxe_image_name,
                 os_type,
+                _boot_target,
             )| HostRow {
                 id: id.to_string(),
                 hostname,
@@ -2954,7 +3122,8 @@ async fn api_hosts(
                     o.label as lan_outlet_label,
                     h.pxe_enabled,
                     pi.name as pxe_image_name,
-                    h.os_type
+                    h.os_type,
+                    h.boot_target
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2998,7 +3167,8 @@ async fn api_hosts(
                     o.label as lan_outlet_label,
                     h.pxe_enabled,
                     pi.name as pxe_image_name,
-                    h.os_type
+                    h.os_type,
+                    h.boot_target
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -3025,7 +3195,18 @@ async fn api_hosts(
     let items = rows
         .into_iter()
         .map(
-            |(id, hostname, ip, mac, _location_name, _lan_outlet_label, pxe_enabled, pxe_image_name, os_type)| {
+            |(
+                id,
+                hostname,
+                ip,
+                mac,
+                _location_name,
+                _lan_outlet_label,
+                pxe_enabled,
+                pxe_image_name,
+                os_type,
+                boot_target,
+            )| {
                 HostApiItem {
                     id: id.to_string(),
                     hostname,
@@ -3034,6 +3215,7 @@ async fn api_hosts(
                     pxe_enabled,
                     pxe_image_name,
                     os_type,
+                    boot_target,
                 }
             },
         )
@@ -3366,10 +3548,7 @@ async fn boot_ipxe(
 ) -> Response {
     let client_ip = addr.ip();
     if !state.config.pxe_enabled {
-        tracing::info!(
-            "PXE Boot request from {} - Status: Exit",
-            client_ip
-        );
+        tracing::info!("PXE Boot request from {} - Status: Exit", client_ip);
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -3393,20 +3572,18 @@ async fn boot_ipxe(
     };
 
     let script = if should_boot {
-        let assets_base = state.config.pxe_http_base_url.as_str().trim_end_matches('/');
-        tracing::info!(
-            "PXE Boot request from {} - Status: Authorized",
-            client_ip
-        );
+        let assets_base = state
+            .config
+            .pxe_http_base_url
+            .as_str()
+            .trim_end_matches('/');
+        tracing::info!("PXE Boot request from {} - Status: Authorized", client_ip);
         format!(
             "#!ipxe\nkernel {}/vmlinuz initrd=initrd.img root=/dev/ram0\ninitrd {}/initrd.img\nboot\n",
             assets_base, assets_base
         )
     } else {
-        tracing::info!(
-            "PXE Boot request from {} - Status: Exit",
-            client_ip
-        );
+        tracing::info!("PXE Boot request from {} - Status: Exit", client_ip);
         "#!ipxe\nexit\n".to_string()
     };
 
@@ -3418,6 +3595,273 @@ async fn boot_ipxe(
         script,
     )
         .into_response()
+}
+
+async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuery>) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if let Some(mac_raw) = query
+        .mac
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        match MacAddr::from_str(mac_raw) {
+            Ok(mac) => {
+                tracing::info!(mac = %mac, "PXE Boot Request from MAC");
+                let image = sqlx::query_scalar::<_, String>(
+                    "select pi.name
+                     from hosts h
+                     join pxe_images pi on pi.id = h.pxe_image_id
+                     where lower(h.mac_address) = lower($1)
+                     limit 1",
+                )
+                .bind(mac.to_string())
+                .fetch_optional(&state.pool)
+                .await;
+                match image {
+                    Ok(Some(name)) => {
+                        let label = name.trim();
+                        if !label.is_empty() {
+                            tracing::info!(mac = %mac, image = %label, "PXE image override found");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, mac = %mac, "failed to look up PXE image");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, mac = %mac_raw, "invalid MAC on PXE menu request");
+            }
+        }
+    }
+
+    let script = format!(
+        "#!ipxe\n\
+menu IPManager - {}\n\
+item --gap --             -----------------------------------------\n\
+item local                Boot from local hard drive\n\
+item shell                Drop to iPXE shell\n\
+item --gap --             -----------------------------------------\n\
+choose --default local --timeout 5000 target && goto ${{target}}\n\
+\n\
+:local\n\
+exit\n\
+\n\
+:shell\n\
+shell\n",
+        state.config.domain_name.trim()
+    );
+
+    (
+        axum::http::HeaderMap::from_iter(std::iter::once((
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+        ))),
+        script,
+    )
+        .into_response()
+}
+
+async fn pxe_unattend(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<UnattendQuery>,
+) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mac_value = if let Some(mac_raw) = query
+        .mac
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        match MacAddr::from_str(mac_raw) {
+            Ok(mac) => Some(mac.to_string()),
+            Err(_) => None,
+        }
+    } else {
+        let client_ip = addr.ip();
+        match sqlx::query_scalar::<_, String>(
+            "select mac_address from hosts where ip_address = $1 limit 1",
+        )
+        .bind(client_ip.to_string())
+        .fetch_optional(&state.pool)
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => None,
+        }
+    };
+
+    let Some(mac_value) = mac_value else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing or invalid MAC; provide ?mac=aa:bb:cc:dd:ee:ff",
+        )
+            .into_response();
+    };
+
+    let mac_compact = mac_value.replace(':', "");
+    let computer_name = format!("BA-CW-{}", mac_compact.to_uppercase());
+
+    let script = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage>
+        <UILanguage>de-DE</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>de-DE</InputLocale>
+      <SystemLocale>de-DE</SystemLocale>
+      <UILanguage>de-DE</UILanguage>
+      <UserLocale>de-DE</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Format>NTFS</Format>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+        <WillShowUI>OnError</WillShowUI>
+      </DiskConfiguration>
+    </component>
+  </settings>
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>{}</ComputerName>
+      <TimeZone>W. Europe Standard Time</TimeZone>
+    </component>
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>de-DE</InputLocale>
+      <SystemLocale>de-DE</SystemLocale>
+      <UILanguage>de-DE</UILanguage>
+      <UserLocale>de-DE</UserLocale>
+    </component>
+  </settings>
+</unattend>
+"#,
+        computer_name
+    );
+
+    (
+        axum::http::HeaderMap::from_iter(std::iter::once((
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/xml; charset=utf-8"),
+        ))),
+        script,
+    )
+        .into_response()
+}
+
+async fn api_set_pxe_boot(
+    State(state): State<AppState>,
+    Json(req): Json<SetBootRequest>,
+) -> Response {
+    let mac = match MacAddr::from_str(req.mac.trim()) {
+        Ok(mac) => mac,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid mac").into_response(),
+    };
+    let target = req.target.trim().to_lowercase();
+    if target != "local" && target != "zenworks" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target must be 'local' or 'zenworks'",
+        )
+            .into_response();
+    }
+
+    let res = sqlx::query("update hosts set boot_target = $1 where lower(mac_address) = lower($2)")
+        .bind(&target)
+        .bind(mac.to_string())
+        .execute(&state.pool)
+        .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                try_sync_dnsmasq(&state, "api_set_pxe_boot").await;
+                StatusCode::OK.into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to update boot_target");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn api_set_host_boot(
+    State(state): State<AppState>,
+    session: Session,
+    Path(mac): Path<String>,
+    Json(req): Json<BootTargetRequest>,
+) -> Response {
+    if let Err(resp) = require_auth_api(&session).await {
+        return resp.into_response();
+    }
+
+    let mac = match MacAddr::from_str(mac.trim()) {
+        Ok(mac) => mac,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid mac").into_response(),
+    };
+    let target = req.target.trim().to_lowercase();
+    if target != "local" && target != "zenworks" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target must be 'local' or 'zenworks'",
+        )
+            .into_response();
+    }
+
+    let res = sqlx::query("update hosts set boot_target = $1 where lower(mac_address) = lower($2)")
+        .bind(&target)
+        .bind(mac.to_string())
+        .execute(&state.pool)
+        .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                tracing::info!(mac = %mac, target = %target, "boot_target updated");
+                try_sync_dnsmasq(&state, "api_set_host_boot").await;
+                tracing::info!(mac = %mac, target = %target, "dnsmasq reloaded after boot_target update");
+                StatusCode::OK.into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, "failed to update boot_target");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 async fn pxe_images_list(
@@ -3833,7 +4277,9 @@ async fn render_pxe_edit_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form, PxeImageForm};
+    use super::{
+        ensure_path_allowed, validate_ipv4, validate_mac, validate_pxe_form, PxeImageForm,
+    };
     use crate::config::Config;
     use std::fs;
     use std::net::Ipv4Addr;

@@ -1,7 +1,7 @@
 mod config;
 mod db;
-mod domain;
 pub mod dhcp;
+mod domain;
 mod integrations;
 mod notifications;
 mod pxe;
@@ -9,8 +9,8 @@ mod web;
 
 use anyhow::{Context, Result};
 use std::{net::SocketAddr, sync::Arc};
-use tokio::sync::{Mutex, oneshot};
 use tera::Tera;
+use tokio::sync::{oneshot, Mutex};
 use tower_sessions::{cookie::Key, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
 
@@ -25,7 +25,8 @@ async fn main() -> Result<()> {
 
     let dnsmasq_status = Arc::new(Mutex::new(dhcp::dnsmasq::DnsmasqStatus::default()));
 
-    if let Err(e) = dhcp::dnsmasq::sync_dnsmasq_hosts(&pool, &cfg, dnsmasq_status.as_ref(), None).await
+    if let Err(e) =
+        dhcp::dnsmasq::sync_dnsmasq_hosts(&pool, &cfg, dnsmasq_status.as_ref(), None).await
     {
         tracing::error!(error = ?e, "Initialer dnsmasq Sync fehlgeschlagen");
         dhcp::dnsmasq::record_sync_error(
