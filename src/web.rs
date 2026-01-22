@@ -4506,10 +4506,12 @@ async fn serve_boot_asset(state: &AppState, client_ip: IpAddr, query: BootAssetQ
 }
 
 async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuery>) -> Response {
+    println!("DEBUG: PXE Menu wurde angefragt!");
     if !state.config.pxe_enabled {
         return StatusCode::NOT_FOUND.into_response();
     }
 
+    let mut host_next_boot_action: Option<String> = None;
     if let Some(mac_raw) = query
         .mac
         .as_deref()
@@ -4519,6 +4521,30 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         match MacAddr::from_str(mac_raw) {
             Ok(mac) => {
                 tracing::info!(mac = %mac, "PXE Boot Request from MAC");
+                let host_row: Result<Option<(String, Option<String>)>, sqlx::Error> = sqlx::query_as(
+                    "select hostname, next_boot_action
+                     from hosts
+                     where lower(mac_address) = lower($1)
+                     limit 1",
+                )
+                .bind(mac.to_string())
+                .fetch_optional(&state.pool)
+                .await;
+                match host_row {
+                    Ok(Some((hostname, next_boot_action))) => {
+                        tracing::info!(
+                            mac = %mac,
+                            hostname = %hostname,
+                            next_boot_action = ?next_boot_action,
+                            "PXE host resolved"
+                        );
+                        host_next_boot_action = next_boot_action;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, mac = %mac, "failed to load host for PXE menu");
+                    }
+                }
                 let image = sqlx::query_scalar::<_, String>(
                     "select pi.name
                      from hosts h
@@ -4548,21 +4574,34 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         }
     }
 
+    let install_enabled = matches!(host_next_boot_action.as_deref(), Some("install"));
+    let menu_default = if install_enabled { "install" } else { "local" };
+    let install_item = if install_enabled {
+        "item install             Start ZENworks Installation\n"
+    } else {
+        ""
+    };
+
     let script = format!(
         "#!ipxe\n\
-menu IPManager - {}\n\
+onerror shell\n\
+menu IPManager - Boot Menu ({})\n\
 item --gap --             -----------------------------------------\n\
 item local                Boot from local hard drive\n\
+{install_item}\
 item shell                Drop to iPXE shell\n\
 item --gap --             -----------------------------------------\n\
-choose --default local --timeout 5000 target && goto ${{target}}\n\
+choose --default {menu_default} --timeout 15000 target && goto ${{target}}\n\
 \n\
 :local\n\
 exit\n\
 \n\
 :shell\n\
-shell\n",
-        state.config.domain_name.trim()
+shell\n\
+",
+        state.config.domain_name.trim(),
+        install_item = install_item,
+        menu_default = menu_default
     );
 
     (
