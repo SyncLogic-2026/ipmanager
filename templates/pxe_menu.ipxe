@@ -1,8 +1,24 @@
 #!ipxe
-{% if action == "INSTALL" %}
-chain {{ base_url }}/boot/install.ipxe?mac={{ mac }}
-{% elif action == "SHELL" %}
-shell
-{% else %}
+
+# Sofortiger Exit fuer normalen Windows-Boot
+{% if action == "LOCAL" %}
 exit
 {% endif %}
+
+:start
+menu IPManager - Host: {{ mac }}
+item --key l local    Boot from Hard Drive (Windows)
+item --key i install  Start Network Installation
+item --key s shell    iPXE Shell
+choose --default local --timeout 3000 target || goto local
+
+:local
+exit
+
+:install
+echo Installation vorbereiten...
+sleep 2
+exit
+
+:shell
+shell
