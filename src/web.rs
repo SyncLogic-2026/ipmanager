@@ -3690,7 +3690,7 @@ async fn api_hosts(
                     pi.name as pxe_image_name,
                     h.os_type,
                     h.boot_target,
-                    h.next_boot_action
+                    h.next_boot_action::text
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -3736,7 +3736,7 @@ async fn api_hosts(
                     pi.name as pxe_image_name,
                     h.os_type,
                     h.boot_target,
-                    h.next_boot_action
+                    h.next_boot_action::text
              from hosts h
              left join locations l on l.id = h.location_id
              left join lan_outlets o on o.id = h.lan_outlet_id
@@ -4529,63 +4529,67 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let mac_raw = match query
-        .mac
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(mac) => mac,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "missing mac; provide ?mac=aa:bb:cc:dd:ee:ff",
-            )
-                .into_response()
+    let mac_raw = query.mac.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let (mac_display, mac_lookup) = match mac_raw {
+        Some(raw) => {
+            let cleaned = raw.replace('-', ":");
+            match MacAddr::from_str(cleaned.as_str()) {
+                Ok(parsed) => (parsed.to_string(), Some(parsed.to_string())),
+                Err(_) => (raw.to_string(), None),
+            }
         }
+        None => ("unknown".to_string(), None),
     };
 
-    let mac = match MacAddr::from_str(mac_raw) {
-        Ok(mac) => mac.to_string(),
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "invalid mac; provide ?mac=aa:bb:cc:dd:ee:ff",
-            )
-                .into_response()
-        }
-    };
+    tracing::info!(mac = %mac_display, "pxe menu requested");
 
-    let action = sqlx::query_scalar::<_, String>(
-        "select next_boot_action::text from hosts where lower(mac_address) = lower($1) limit 1",
-    )
-    .bind(&mac)
-    .fetch_optional(&state.pool)
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| "LOCAL".to_string());
+    let action = if let Some(mac) = mac_lookup.as_deref() {
+        sqlx::query_scalar::<_, String>(
+            "select next_boot_action::text from hosts where lower(mac_address) = lower($1) limit 1",
+        )
+        .bind(mac)
+        .fetch_optional(&state.pool)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "LOCAL".to_string())
+    } else {
+        "LOCAL".to_string()
+    };
 
     let mut ctx = Context::new();
     ctx.insert("action", &action);
-    ctx.insert("mac", &mac);
+    ctx.insert("mac", &mac_display);
     ctx.insert(
         "base_url",
         state.config.base_url.as_str().trim_end_matches('/'),
     );
 
     let script = match state.templates.render("pxe_menu.ipxe", &ctx) {
-        Ok(content) => content,
+        Ok(content) => {
+            if content.starts_with("#!ipxe") {
+                content
+            } else {
+                format!("#!ipxe\n{}", content)
+            }
+        }
         Err(e) => {
             tracing::error!(error = ?e, "pxe menu template render failed");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            return (
+                axum::http::HeaderMap::from_iter(std::iter::once((
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("text/plain"),
+                ))),
+                "#!ipxe\necho Template Error\nshell",
+            )
+                .into_response();
         }
     };
 
     (
         axum::http::HeaderMap::from_iter(std::iter::once((
             axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
+            axum::http::HeaderValue::from_static("text/plain"),
         ))),
         script,
     )

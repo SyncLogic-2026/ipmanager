@@ -1,24 +1,31 @@
 #!ipxe
 
-# Sofortiger Exit fuer normalen Windows-Boot
-{% if action == "LOCAL" %}
-exit
-{% endif %}
+# Verhindert das sofortige Schliessen des Fensters bei Fehlern
+shell || echo Shell failed, rebooting... && sleep 5 && reboot
 
 :start
-menu IPManager - Host: {{ mac }}
-item --key l local    Boot from Hard Drive (Windows)
-item --key i install  Start Network Installation
-item --key s shell    iPXE Shell
-choose --default local --timeout 3000 target || goto local
+# Hintergrundfarbe und Titel fuer Sichtbarkeit
+console --picture http://10.70.99.33:3000/assets/logo.png ||
+menu --autohne IPManager NETWORK BOOT
+item --key l local    [L] Windows von Festplatte starten
+item --key i install  [I] OS Installation starten
+item --key s shell    [S] iPXE Shell
+item --key r reboot   [R] Neustart
+
+# WICHTIG: Timeout auf 0 setzen (wartet unendlich)
+choose --timeout 0 --default local target && goto ${target}
 
 :local
 exit
 
 :install
-echo Installation vorbereiten...
-sleep 2
-exit
+echo Installation wird geladen...
+sleep 3
+# Hier kommt spaeter der Kernel-Link
+goto start
+
+:reboot
+reboot
 
 :shell
 shell
