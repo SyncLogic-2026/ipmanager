@@ -4551,25 +4551,24 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
 
     println!(">>> PXE Request von: {}", mac_display);
 
-    let (is_authorized, action, hostname, location) = if let Some(mac) = mac_lookup.as_deref() {
-        let row: Option<(bool, Option<String>, String, Option<String>)> = sqlx::query_as(
-            "select h.is_authorized,
-                    h.next_boot_action::text,
+    let (action, hostname, location) = if let Some(mac) = mac_lookup.as_deref() {
+        let mac_query = mac.to_lowercase();
+        let row: Option<(Option<String>, String, Option<String>)> = sqlx::query_as(
+            "select h.next_boot_action::text,
                     h.hostname,
                     coalesce(l.name, h.location) as location
              from hosts h
              left join locations l on l.id = h.location_id
-             where lower(h.mac_address) = lower($1)
+             where lower(h.mac_address) = $1
              limit 1",
         )
-        .bind(mac)
+        .bind(mac_query)
         .fetch_optional(&state.pool)
         .await
         .ok()
         .flatten();
         match row {
-            Some((is_authorized, next_boot_action, hostname, location)) => (
-                is_authorized,
+            Some((next_boot_action, hostname, location)) => (
                 next_boot_action.unwrap_or_else(|| "LOCAL".to_string()),
                 hostname,
                 location.unwrap_or_default(),
@@ -4583,10 +4582,6 @@ async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuer
         log_security_event(&state.pool, &mac_display, "Missing or invalid MAC").await;
         return (StatusCode::FORBIDDEN, "Security Alert: Unknown MAC").into_response();
     };
-
-    if !is_authorized {
-        return (StatusCode::FORBIDDEN, "Access Denied: Host not authorized").into_response();
-    }
 
     let mut ctx = Context::new();
     ctx.insert("action", &action);
