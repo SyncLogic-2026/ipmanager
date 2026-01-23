@@ -3,7 +3,7 @@ use axum::{
     http::{header::ACCEPT, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{get, patch, post, put},
+    routing::{get, get_service, patch, post, put},
     Json, Router,
 };
 use bytes::Bytes;
@@ -33,7 +33,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::dhcp::dnsmasq;
 use crate::domain::mac::MacAddr;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -440,6 +440,10 @@ pub fn router(state: AppState) -> Router {
         .route("/boot/install.ipxe", get(boot_install_ipxe))
         .route("/boot/kernel", get(boot_kernel_file))
         .route("/boot/initrd", get(boot_initrd_file))
+        .route(
+            "/download/ipxe-usb",
+            get_service(ServeFile::new("assets/ipxe.usb")),
+        )
         .route("/status", get(status_page))
         .route("/help", get(help_page))
         .route("/docs", get(help_page))
@@ -2773,7 +2777,7 @@ async fn post_reset_boot_action(
         .flatten();
 
     let res = sqlx::query(
-        "update hosts set next_boot_action = 'local', boot_action_updated_at = now() where id = $1",
+        "update hosts set next_boot_action = 'LOCAL', boot_action_updated_at = now() where id = $1",
     )
     .bind(id)
     .execute(&state.pool)
@@ -4226,10 +4230,10 @@ async fn load_host_pxe_data(
 
 async fn reset_next_boot_action(state: &AppState, client_ip: IpAddr, mac: Option<&str>) {
     let query = if mac.is_some() {
-        "update hosts set next_boot_action = 'local', boot_action_updated_at = now()
+        "update hosts set next_boot_action = 'LOCAL', boot_action_updated_at = now()
          where lower(mac_address) = lower($1)"
     } else {
-        "update hosts set next_boot_action = 'local', boot_action_updated_at = now()
+        "update hosts set next_boot_action = 'LOCAL', boot_action_updated_at = now()
          where ip_address = $1"
     };
 
@@ -4505,111 +4509,22 @@ async fn serve_boot_asset(state: &AppState, client_ip: IpAddr, query: BootAssetQ
     response
 }
 
-async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuery>) -> Response {
-    println!("DEBUG: PXE Menu wurde angefragt!");
-    if !state.config.pxe_enabled {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-
-    let mut host_next_boot_action: Option<String> = None;
+async fn pxe_menu(Query(query): Query<PxeMenuQuery>) -> Response {
     if let Some(mac_raw) = query
         .mac
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        match MacAddr::from_str(mac_raw) {
-            Ok(mac) => {
-                tracing::info!(mac = %mac, "PXE Boot Request from MAC");
-                let host_row: Result<Option<(String, Option<String>)>, sqlx::Error> = sqlx::query_as(
-                    "select hostname, next_boot_action
-                     from hosts
-                     where lower(mac_address) = lower($1)
-                     limit 1",
-                )
-                .bind(mac.to_string())
-                .fetch_optional(&state.pool)
-                .await;
-                match host_row {
-                    Ok(Some((hostname, next_boot_action))) => {
-                        tracing::info!(
-                            mac = %mac,
-                            hostname = %hostname,
-                            next_boot_action = ?next_boot_action,
-                            "PXE host resolved"
-                        );
-                        host_next_boot_action = next_boot_action;
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(error = ?e, mac = %mac, "failed to load host for PXE menu");
-                    }
-                }
-                let image = sqlx::query_scalar::<_, String>(
-                    "select pi.name
-                     from hosts h
-                     join pxe_images pi on pi.id = h.pxe_image_id
-                     where lower(h.mac_address) = lower($1)
-                     limit 1",
-                )
-                .bind(mac.to_string())
-                .fetch_optional(&state.pool)
-                .await;
-                match image {
-                    Ok(Some(name)) => {
-                        let label = name.trim();
-                        if !label.is_empty() {
-                            tracing::info!(mac = %mac, image = %label, "PXE image override found");
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(error = ?e, mac = %mac, "failed to look up PXE image");
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = ?e, mac = %mac_raw, "invalid MAC on PXE menu request");
-            }
-        }
+        tracing::info!(mac = %mac_raw, "PXE menu request");
     }
-
-    let install_enabled = matches!(host_next_boot_action.as_deref(), Some("install"));
-    let menu_default = if install_enabled { "install" } else { "local" };
-    let install_item = if install_enabled {
-        "item install             Start ZENworks Installation\n"
-    } else {
-        ""
-    };
-
-    let script = format!(
-        "#!ipxe\n\
-onerror shell\n\
-menu IPManager - Boot Menu ({})\n\
-item --gap --             -----------------------------------------\n\
-item local                Boot from local hard drive\n\
-{install_item}\
-item shell                Drop to iPXE shell\n\
-item --gap --             -----------------------------------------\n\
-choose --default {menu_default} --timeout 15000 target && goto ${{target}}\n\
-\n\
-:local\n\
-exit\n\
-\n\
-:shell\n\
-shell\n\
-",
-        state.config.domain_name.trim(),
-        install_item = install_item,
-        menu_default = menu_default
-    );
 
     (
         axum::http::HeaderMap::from_iter(std::iter::once((
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
         ))),
-        script,
+        "#!ipxe",
     )
         .into_response()
 }
@@ -4826,7 +4741,7 @@ async fn api_set_host_install(
     };
 
     let res = sqlx::query(
-        "update hosts set next_boot_action = 'install', boot_action_updated_at = now() where id = $1",
+        "update hosts set next_boot_action = 'INSTALL', boot_action_updated_at = now() where id = $1",
     )
     .bind(id)
     .execute(&state.pool)
@@ -4866,7 +4781,7 @@ async fn post_set_install_action(
         .flatten();
 
     let res = sqlx::query(
-        "update hosts set next_boot_action = 'install', boot_action_updated_at = now() where id = $1",
+        "update hosts set next_boot_action = 'INSTALL', boot_action_updated_at = now() where id = $1",
     )
     .bind(id)
     .execute(&state.pool)
@@ -4912,7 +4827,7 @@ async fn api_set_host_next_boot(
     let action = match action_raw.as_str() {
         "" | "none" | "clear" | "local" => None,
         "install" | "reinstall" | "reinstall_windows" | "reinstall-windows" => {
-            Some("install".to_string())
+            Some("INSTALL".to_string())
         }
         _ => {
             return (
@@ -4924,7 +4839,7 @@ async fn api_set_host_next_boot(
     };
 
     let res = sqlx::query(
-        "update hosts set next_boot_action = $1, boot_action_updated_at = now() where id = $2",
+        "update hosts set next_boot_action = $1::boot_action, boot_action_updated_at = now() where id = $2",
     )
     .bind(action.as_deref())
     .bind(id)

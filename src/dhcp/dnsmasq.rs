@@ -104,17 +104,21 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str("bogus-priv\n");
     output.push_str("no-resolv\n");
     output.push_str("server=8.8.8.8\n");
-    output.push_str("port=53\n");
+    output.push_str("port=0\n");
     output.push_str(&format!("dhcp-option=option:domain-name,{}\n", domain_name));
     output.push_str("enable-tftp\n");
     output.push_str("tftp-root=/var/lib/tftpboot\n");
     output.push_str("dhcp-match=set:efi64,option:client-arch,7\n");
     output.push_str("dhcp-match=set:efi64,option:client-arch,8\n");
     output.push_str("dhcp-match=set:efi64,option:client-arch,9\n");
-    output.push_str("dhcp-boot=tag:!efi64,boot/x64/wdsnbp.com\n");
-    output.push_str("dhcp-boot=tag:efi64,boot/x64/wdsmgfw.efi\n");
-    output.push_str("dhcp-boot=tag:boot_zenworks,boot/x64/bcd.zenworks\n");
-    output.push_str("dhcp-boot=tag:boot_local,boot/x64/bcd.default\n");
+    output.push_str("dhcp-userclass=set:is_ipxe,iPXE\n");
+    output.push_str("dhcp-match=set:is_ipxe,175\n");
+    output.push_str(&format!(
+        "dhcp-boot=tag:is_ipxe,{}\n",
+        format!("{}/api/v1/pxe/menu", config.base_url.as_str().trim_end_matches('/'))
+    ));
+    output.push_str("dhcp-boot=tag:!is_ipxe,tag:efi64,boot/x64/ipxe.efi\n");
+    output.push_str("dhcp-boot=tag:!is_ipxe,tag:!efi64,boot/x64/ipxe.kpxe\n");
     output.push_str("dhcp-authoritative\n");
     output.push_str("dhcp-ignore=tag:!known\n");
 

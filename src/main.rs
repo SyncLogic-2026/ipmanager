@@ -3,6 +3,7 @@ mod db;
 pub mod dhcp;
 mod domain;
 mod integrations;
+mod models;
 mod notifications;
 mod pxe;
 mod web;
@@ -58,10 +59,15 @@ async fn main() -> Result<()> {
         .with_signed(session_key);
 
     let app = web::router(state).layer(session_layer);
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
+    let bind_addr = if cfg.bind_addr.trim() == "127.0.0.1:3000" {
+        "0.0.0.0:3000".to_string()
+    } else {
+        cfg.bind_addr.clone()
+    };
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .context("failed to bind server address")?;
-    tracing::info!(addr = %cfg.bind_addr, "listening");
+    tracing::info!(addr = %bind_addr, "listening");
 
     axum::serve(
         listener,

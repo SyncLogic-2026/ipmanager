@@ -1,0 +1,26 @@
+   Compiling ipmanager v0.1.0 (/home/technik/ipmanager)
+    Finished `release` profile [optimized] target(s) in 24.68s
+     Running `target/release/ipmanager`
+[2m2026-01-22T14:41:08.537036Z[0m [32m INFO[0m [2mipmanager::db[0m[2m:[0m initial admin already exists [3muser[0m[2m=[0madmin
+[2m2026-01-22T14:41:08.539398Z[0m [32m INFO[0m [2mipmanager::dhcp::dnsmasq[0m[2m:[0m dnsmasq global config written [3mpath[0m[2m=[0m"/etc/dnsmasq.d/00-global.conf"
+[2m2026-01-22T14:41:08.544953Z[0m [32m INFO[0m [2mipmanager::dhcp::dnsmasq[0m[2m:[0m 
+Windows PXE boot files:
+[OK] wdsmgfw.efi
+[OK] bcd
+[MISSING] boot.wim
+HINWEIS: Um HTTP-Boot zu nutzen, stelle sicher, dass die BCD via bcdedit konfiguriert ist: bcdedit /store BCD /set {ramdiskoptions} ramdisktftpblocksize 16384 bcdedit /store BCD /set {bootmgr} nobootux yes (optional fuer schnelleren Start)
+[2m2026-01-22T14:41:08.548004Z[0m [32m INFO[0m [2mipmanager::dhcp::dnsmasq[0m[2m:[0m dnsmasq host configs written [3mpath[0m[2m=[0m/etc/dnsmasq.d
+[2m2026-01-22T14:41:08.666217Z[0m [32m INFO[0m [2mipmanager::dhcp::dnsmasq[0m[2m:[0m dnsmasq reload command succeeded [3mcommand[0m[2m=[0m"sudo systemctl restart dnsmasq"
+[2m2026-01-22T14:41:08.673946Z[0m [32m INFO[0m [2msqlx::postgres::notice[0m[2m:[0m schema "tower_sessions" already exists, skipping
+[2m2026-01-22T14:41:08.674833Z[0m [32m INFO[0m [2msqlx::postgres::notice[0m[2m:[0m relation "session" already exists, skipping
+[2m2026-01-22T14:41:08.675533Z[0m [32m INFO[0m [2mipmanager::web[0m[2m:[0m Serving PXE assets from: /var/lib/tftpboot
+[2m2026-01-22T14:41:08.675572Z[0m [32m INFO[0m [2mipmanager::web[0m[2m:[0m Serving PXE configs from: /var/lib/tftpboot/pxe-configs
+[2m2026-01-22T14:41:08.675655Z[0m [32m INFO[0m [2mipmanager::web[0m[2m:[0m wdsmgfw.efi present in boot directory [3mfile[0m[2m=[0mwdsmgfw.efi
+[2m2026-01-22T14:41:08.676199Z[0m [32m INFO[0m [2mipmanager[0m[2m:[0m listening [3maddr[0m[2m=[0m0.0.0.0:3000
+DEBUG: PXE Menu wurde angefragt!
+[2m2026-01-22T14:41:14.909308Z[0m [32m INFO[0m [1mcall[0m[2m:[0m [2mipmanager::web[0m[2m:[0m PXE Boot Request from MAC [3mmac[0m[2m=[0m10:e7:c6:b4:03:90
+[2m2026-01-22T14:41:14.910706Z[0m [32m INFO[0m [1mcall[0m[2m:[0m [2mipmanager::web[0m[2m:[0m PXE host resolved [3mmac[0m[2m=[0m10:e7:c6:b4:03:90 [3mhostname[0m[2m=[0mcl01 [3mnext_boot_action[0m[2m=[0mSome("local")
+[2m2026-01-22T14:41:14.913099Z[0m [32m INFO[0m [1mcall[0m[2m:[0m [2mipmanager::web[0m[2m:[0m PXE image override found [3mmac[0m[2m=[0m10:e7:c6:b4:03:90 [3mimage[0m[2m=[0mwindows11
+DEBUG: PXE Menu wurde angefragt!
+[2m2026-01-22T14:41:30.189653Z[0m [32m INFO[0m [1mcall[0m[2m:[0m [2mipmanager::web[0m[2m:[0m PXE Boot Request from MAC [3mmac[0m[2m=[0m00:0c:29:54:13:f3
+[2m2026-01-22T14:41:30.190392Z[0m [32m INFO[0m [1mcall[0m[2m:[0m [2mipmanager::web[0m[2m:[0m PXE host resolved [3mmac[0m[2m=[0m00:0c:29:54:13:f3 [3mhostname[0m[2m=[0mmacmon [3mnext_boot_action[0m[2m=[0mSome("install")
