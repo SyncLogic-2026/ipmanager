@@ -23,5 +23,13 @@
   {% if host.pxe_image_name %}
     <tr><th>PXE Image</th><td>{{ host.pxe_image_name }}</td></tr>
   {% endif %}
+  <tr><th>Next Boot Action</th><td>{{ host.next_boot_action | default(value="LOCAL") }}</td></tr>
 </table>
+
+<h2>Boot-Aktion setzen</h2>
+<form method="post" action="/hosts/{{ host.id }}/set-boot-action">
+  <button type="submit" name="action" value="LOCAL">Boot Local</button>
+  <button type="submit" name="action" value="INSTALL">Reinstall</button>
+  <button type="submit" name="action" value="SHELL">Shell</button>
+</form>
 {% endblock content %}

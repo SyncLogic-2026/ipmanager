@@ -218,6 +218,11 @@ pub struct HostUpdateForm {
     pub os_type: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct BootActionForm {
+    pub action: String,
+}
+
 #[derive(Deserialize, Default)]
 pub struct HostsQuery {
     pub q: Option<String>,
@@ -307,6 +312,7 @@ struct HostShow {
     pxe_image_id: Option<String>,
     pxe_image_name: Option<String>,
     os_type: Option<String>,
+    next_boot_action: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -417,6 +423,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hosts/:id/delete", post(host_delete))
         .route("/hosts/:id/reset-boot", post(post_reset_boot_action))
         .route("/hosts/:id/set-install", post(post_set_install_action))
+        .route("/hosts/:id/set-boot-action", post(post_set_boot_action))
         .route("/hosts/import", post(hosts_import))
         .route("/hosts/export", get(hosts_export))
         .route("/locations", get(locations_list).post(locations_create))
@@ -2344,6 +2351,7 @@ type HostShowRowDb = (
     Option<i64>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 async fn host_show(
@@ -2369,7 +2377,8 @@ async fn host_show(
                 h.pxe_enabled,
                 h.pxe_image_id,
                 pi.name as pxe_image_name,
-                h.os_type
+                h.os_type,
+                h.next_boot_action::text
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2408,6 +2417,7 @@ async fn host_show(
         pxe_image_id,
         pxe_image_name,
         os_type,
+        next_boot_action,
     ) = row;
 
     let host = HostShow {
@@ -2425,6 +2435,7 @@ async fn host_show(
         pxe_image_id: pxe_image_id.map(|id| id.to_string()),
         pxe_image_name,
         os_type,
+        next_boot_action,
     };
 
     let mut ctx = Context::new();
@@ -2819,6 +2830,7 @@ type HostEditRowDb = (
     Option<i64>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>, ()> {
@@ -2836,7 +2848,8 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
                 h.pxe_enabled,
                 h.pxe_image_id,
                 pi.name as pxe_image_name,
-                h.os_type
+                h.os_type,
+                h.next_boot_action::text
          from hosts h
          left join locations l on l.id = h.location_id
          left join lan_outlets o on o.id = h.lan_outlet_id
@@ -2866,6 +2879,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             pxe_image_id,
             pxe_image_name,
             os_type,
+            next_boot_action,
         )| HostShow {
             id: hid.to_string(),
             hostname,
@@ -2881,6 +2895,7 @@ async fn load_host_for_edit(pool: &PgPool, id: Uuid) -> Result<Option<HostShow>,
             pxe_image_id: pxe_image_id.map(|id| id.to_string()),
             pxe_image_name,
             os_type,
+            next_boot_action,
         },
     ))
 }
@@ -4509,22 +4524,70 @@ async fn serve_boot_asset(state: &AppState, client_ip: IpAddr, query: BootAssetQ
     response
 }
 
-async fn pxe_menu(Query(query): Query<PxeMenuQuery>) -> Response {
-    if let Some(mac_raw) = query
+async fn pxe_menu(State(state): State<AppState>, Query(query): Query<PxeMenuQuery>) -> Response {
+    if !state.config.pxe_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mac_raw = match query
         .mac
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        tracing::info!(mac = %mac_raw, "PXE menu request");
-    }
+        Some(mac) => mac,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "missing mac; provide ?mac=aa:bb:cc:dd:ee:ff",
+            )
+                .into_response()
+        }
+    };
+
+    let mac = match MacAddr::from_str(mac_raw) {
+        Ok(mac) => mac.to_string(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "invalid mac; provide ?mac=aa:bb:cc:dd:ee:ff",
+            )
+                .into_response()
+        }
+    };
+
+    let action = sqlx::query_scalar::<_, String>(
+        "select next_boot_action::text from hosts where lower(mac_address) = lower($1) limit 1",
+    )
+    .bind(&mac)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| "LOCAL".to_string());
+
+    let mut ctx = Context::new();
+    ctx.insert("action", &action);
+    ctx.insert("mac", &mac);
+    ctx.insert(
+        "base_url",
+        state.config.base_url.as_str().trim_end_matches('/'),
+    );
+
+    let script = match state.templates.render("pxe_menu.ipxe", &ctx) {
+        Ok(content) => content,
+        Err(e) => {
+            tracing::error!(error = ?e, "pxe menu template render failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     (
         axum::http::HeaderMap::from_iter(std::iter::once((
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderValue::from_static("text/plain; charset=utf-8"),
         ))),
-        "#!ipxe",
+        script,
     )
         .into_response()
 }
@@ -4803,6 +4866,53 @@ async fn post_set_install_action(
         }
         Err(e) => {
             tracing::error!(error = ?e, host_id = %id, "failed to set next_boot_action");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn post_set_boot_action(
+    State(state): State<AppState>,
+    session: Session,
+    Path(id): Path<Uuid>,
+    Form(form): Form<BootActionForm>,
+) -> Response {
+    if let Err(resp) = require_auth(&session).await {
+        return resp;
+    }
+
+    let action_raw = form.action.trim().to_lowercase();
+    let action = match action_raw.as_str() {
+        "local" => "LOCAL",
+        "install" | "reinstall" => "INSTALL",
+        "shell" => "SHELL",
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "action must be local, install, or shell",
+            )
+                .into_response()
+        }
+    };
+
+    let res = sqlx::query(
+        "update hosts set next_boot_action = $1::boot_action, boot_action_updated_at = now() where id = $2",
+    )
+    .bind(action)
+    .bind(id)
+    .execute(&state.pool)
+    .await;
+
+    match res {
+        Ok(result) => {
+            if result.rows_affected() == 0 {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                Redirect::to(&format!("/hosts/{}", id)).into_response()
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = ?e, host_id = %id, "failed to update next_boot_action");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -5201,6 +5311,7 @@ async fn render_host_edit_error(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
+        next_boot_action: None,
     };
 
     let mut ctx = Context::new();

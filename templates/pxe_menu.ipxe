@@ -1,0 +1,8 @@
+#!ipxe
+{% if action == "INSTALL" %}
+chain {{ base_url }}/boot/install.ipxe?mac={{ mac }}
+{% elif action == "SHELL" %}
+shell
+{% else %}
+exit
+{% endif %}

@@ -115,7 +115,10 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str("dhcp-match=set:is_ipxe,175\n");
     output.push_str(&format!(
         "dhcp-boot=tag:is_ipxe,{}\n",
-        format!("{}/api/v1/pxe/menu", config.base_url.as_str().trim_end_matches('/'))
+        format!(
+            "{}/api/v1/pxe/menu",
+            config.base_url.as_str().trim_end_matches('/')
+        )
     ));
     output.push_str("dhcp-boot=tag:!is_ipxe,tag:efi64,boot/x64/ipxe.efi\n");
     output.push_str("dhcp-boot=tag:!is_ipxe,tag:!efi64,boot/x64/ipxe.kpxe\n");
