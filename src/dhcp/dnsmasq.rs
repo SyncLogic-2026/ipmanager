@@ -95,8 +95,7 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str("log-queries\n");
     let domain_name = ranges
         .iter()
-        .map(|range| range.dns_zone.as_deref().map(str::trim))
-        .flatten()
+        .filter_map(|range| range.dns_zone.as_deref().map(str::trim))
         .find(|value| !value.is_empty())
         .unwrap_or_else(|| config.domain_name.trim());
     output.push_str("expand-hosts\n");
@@ -116,11 +115,8 @@ pub async fn generate_global_config(pool: &PgPool, config: &crate::config::Confi
     output.push_str("dhcp-userclass=set:is_ipxe,iPXE\n");
     output.push_str("dhcp-match=set:is_ipxe,175\n");
     output.push_str(&format!(
-        "dhcp-boot=tag:is_ipxe,{}\n",
-        format!(
-            "{}/api/v1/pxe/menu",
-            config.base_url.as_str().trim_end_matches('/')
-        )
+        "dhcp-boot=tag:is_ipxe,{}/api/v1/pxe/menu\n",
+        config.base_url.as_str().trim_end_matches('/')
     ));
     output.push_str("dhcp-boot=tag:!is_ipxe,tag:efi64,boot/x64/ipxe.efi\n");
     output.push_str("dhcp-boot=tag:!is_ipxe,tag:!efi64,boot/x64/ipxe.kpxe\n");

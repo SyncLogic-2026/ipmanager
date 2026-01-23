@@ -315,6 +315,18 @@ struct HostShow {
     next_boot_action: Option<String>,
 }
 
+type HostsExportRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Uuid,
+    bool,
+    String,
+    Option<String>,
+);
+
 #[derive(Serialize)]
 struct LocationOption {
     id: String,
@@ -944,7 +956,7 @@ fn build_hosts_redirect_url(
 fn derive_location_from_hostname_ip(hostname: &str, ip: &str) -> Option<String> {
     let host = hostname.trim();
     if !host.is_empty() {
-        if let Some(prefix) = host.split(|c| c == '-' || c == '_').next() {
+        if let Some(prefix) = host.split(['-', '_']).next() {
             let prefix = prefix.trim();
             if prefix.len() >= 2 && prefix.chars().all(|c| c.is_ascii_alphabetic()) {
                 return Some(prefix.to_string());
@@ -1677,7 +1689,7 @@ async fn hosts_import(
     if header_map.is_none() {
         records.push((1, headers.clone()));
     }
-    let mut line_no = if header_map.is_some() { 2 } else { 2 };
+    let mut line_no = 2;
     for record in rdr.records() {
         match record {
             Ok(rec) => records.push((line_no, rec)),
@@ -1851,17 +1863,7 @@ async fn hosts_export(
         return Ok(resp);
     }
 
-    let rows: Vec<(
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-        Uuid,
-        bool,
-        String,
-        Option<String>,
-    )> = sqlx::query_as(
+    let rows: Vec<HostsExportRow> = sqlx::query_as(
         "select hostname,
                 ip_address,
                 mac_address,
@@ -3698,7 +3700,7 @@ async fn api_hosts(
              order by h.hostname asc
              limit $1 offset $2",
         )
-        .bind(limit as i64)
+        .bind(limit)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
@@ -3748,7 +3750,7 @@ async fn api_hosts(
              limit $2 offset $3",
         )
         .bind(&like)
-        .bind(limit as i64)
+        .bind(limit)
         .bind(offset)
         .fetch_all(&state.pool)
         .await
@@ -4181,19 +4183,21 @@ struct HostPxeData {
     cmdline: Option<String>,
 }
 
+type HostPxeRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 async fn load_host_pxe_data(
     state: &AppState,
     client_ip: IpAddr,
     mac: Option<&str>,
 ) -> Option<HostPxeData> {
-    let row: Option<(
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    )> = if let Some(mac) = mac {
+    let row: Option<HostPxeRow> = if let Some(mac) = mac {
         sqlx::query_as(
             "select h.next_boot_action,
                     pi.kind,
@@ -4402,9 +4406,9 @@ async fn boot_install_ipxe(
     lines.push("#!ipxe".to_string());
     lines.push(format!("set ip {}", client_ip));
 
-    match host_data.and_then(|data| {
+    match host_data.map(|data| {
         let kind = data.kind.as_deref().unwrap_or("").trim().to_string();
-        Some((kind, data))
+        (kind, data)
     }) {
         Some((kind, data)) if kind == "linux" => {
             if let Some(kernel_path) = data.kernel_path.as_deref() {
@@ -4644,16 +4648,13 @@ async fn pxe_unattend(
         }
     } else {
         let client_ip = addr.ip();
-        match sqlx::query_scalar::<_, String>(
+        sqlx::query_scalar::<_, String>(
             "select mac_address from hosts where ip_address = $1 limit 1",
         )
         .bind(client_ip.to_string())
         .fetch_optional(&state.pool)
         .await
-        {
-            Ok(v) => v,
-            Err(_) => None,
-        }
+        .unwrap_or_default()
     };
 
     let Some(mac_value) = mac_value else {
@@ -5486,6 +5487,9 @@ mod tests {
             dnsmasq_interface: Some("eth0".to_string()),
             dnsmasq_bind_addr: "127.0.0.1".to_string(),
             dnsmasq_port: 53,
+            domain_name: "example.local".to_string(),
+            ipmanager_ip: "127.0.0.1".to_string(),
+            enable_ipxe: true,
         }
     }
 
